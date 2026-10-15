@@ -1,1 +1,1 @@
-This is a vibecoded automatic retracing script I'm making for fun.
+This is a vibecoded automatic retracing script for chiptune music I'm making for fun.
