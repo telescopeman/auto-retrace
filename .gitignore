@@ -1,0 +1,5 @@
+# Operating System files
+.DS_Store
+
+# Other stuff
+render_queue/
