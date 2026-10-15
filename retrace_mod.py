@@ -38,6 +38,7 @@ import struct
 import re
 import argparse
 import collections
+import zlib
 import sys
 import subprocess
 import tempfile
@@ -768,10 +769,1717 @@ def parse_furnace_text(text, subsong=0):
     return m
 
 
+# ----------------------------------------------------------------------------
+# Furnace .fur reader (any version, any chips)
+# ----------------------------------------------------------------------------
+# Follows Furnace's own loader (src/engine/fileOps/fur.cpp, song.cpp) block by block:
+# the old INFO header (<240) and the new INF2 one (>=240), SONG / SNG2 subsongs, and the
+# old PATR (<157) and new PATN pattern blocks.  Instruments, wavetables and samples are
+# located but not decoded (their raw blocks are kept for a later .fur writer).
+FUR_MAGIC = b'-Furnace module-'
+# chip id -> (name, nominal channel count), from Furnace's papers/format.md
+FUR_CHIPS = {
+    0x01: ('YMU759', 17),
+    0x03: ('SN76489/Sega PSG', 4),
+    0x04: ('Game Boy', 4),
+    0x05: ('PC Engine', 6),
+    0x06: ('NES', 5),
+    0x07: ('C64 (8580)', 3),
+    0x47: ('C64 (6581)', 3),
+    0x80: ('AY-3-8910', 3),
+    0x81: ('Amiga', 4),
+    0x82: ('YM2151', 8),
+    0x83: ('YM2612', 6),
+    0x84: ('TIA', 2),
+    0x85: ('VIC-20', 4),
+    0x86: ('PET', 1),
+    0x87: ('SNES', 8),
+    0x88: ('VRC6', 3),
+    0x89: ('OPLL (YM2413)', 9),
+    0x8a: ('FDS', 1),
+    0x8b: ('MMC5', 3),
+    0x8c: ('Namco 163', 8),
+    0x8d: ('YM2203', 6),
+    0x8e: ('YM2608', 16),
+    0x8f: ('OPL (YM3526)', 9),
+    0x90: ('OPL2 (YM3812)', 9),
+    0x91: ('OPL3 (YMF262)', 18),
+    0x92: ('MultiPCM', 28),
+    0x93: ('Intel 8253 (beeper)', 1),
+    0x94: ('POKEY', 4),
+    0x95: ('RF5C68', 8),
+    0x96: ('WonderSwan', 4),
+    0x97: ('Philips SAA1099', 6),
+    0x98: ('OPZ (YM2414)', 8),
+    0x99: ('Pokémon Mini', 1),
+    0x9a: ('AY8930', 3),
+    0x9b: ('SegaPCM', 16),
+    0x9c: ('Virtual Boy', 6),
+    0x9d: ('VRC7', 6),
+    0x9e: ('YM2610B', 16),
+    0x9f: ('ZX Spectrum (beeper, SFX-like tildearrow engine)', 6),
+    0xa0: ('YM2612 extended', 9),
+    0xa1: ('Konami SCC', 5),
+    0xa2: ('OPL drums (YM3526)', 11),
+    0xa3: ('OPL2 drums (YM3812)', 11),
+    0xa4: ('OPL3 drums (YMF262)', 20),
+    0xa5: ('Neo Geo (YM2610)', 14),
+    0xa6: ('Neo Geo extended (YM2610)', 17),
+    0xa7: ('OPLL drums (YM2413)', 11),
+    0xa8: ('Atari Lynx', 4),
+    0xaa: ('MSM6295', 4),
+    0xab: ('MSM6258', 1),
+    0xac: ('Commander X16 (VERA)', 17),
+    0xad: ('Bubble System WSG', 2),
+    0xae: ('OPL4 (YMF278B)', 42),
+    0xaf: ('OPL4 drums (YMF278B)', 44),
+    0xb0: ('Seta/Allumer X1-010', 16),
+    0xb1: ('Ensoniq ES5506', 32),
+    0xb2: ('Yamaha Y8950', 10),
+    0xb3: ('Yamaha Y8950 drums', 12),
+    0xb4: ('Konami SCC+', 5),
+    0xb5: ('tildearrow Sound Unit', 8),
+    0xb6: ('YM2203 extended', 9),
+    0xb7: ('YM2608 extended', 19),
+    0xb8: ('YMZ280B', 8),
+    0xb9: ('Namco WSG', 3),
+    0xba: ('Namco C15', 8),
+    0xbb: ('Namco C30', 8),
+    0xbc: ('MSM5232', 8),
+    0xbd: ('YM2612 DualPCM extended', 11),
+    0xbe: ('YM2612 DualPCM', 7),
+    0xbf: ('T6W28', 4),
+    0xc0: ('PCM DAC', 1),
+    0xc1: ('YM2612 CSM', 10),
+    0xc2: ('Neo Geo CSM (YM2610)', 18),
+    0xc3: ('YM2203 CSM', 10),
+    0xc4: ('YM2608 CSM', 20),
+    0xc5: ('YM2610B CSM', 20),
+    0xc6: ('K007232', 2),
+    0xc7: ('GA20', 4),
+    0xc8: ('SM8521', 3),
+    0xc9: ('M114S', 16),
+    0xca: ('ZX Spectrum (beeper, QuadTone engine)', 5),
+    0xcb: ('Casio PV-1000', 3),
+    0xcc: ('K053260', 4),
+    0xcd: ('TED', 2),
+    0xce: ('Namco C140', 24),
+    0xcf: ('Namco C219', 16),
+    0xd0: ('Namco C352', 32),
+    0xd1: ('ESFM', 18),
+    0xd2: ('Ensoniq ES5503 (hard pan)', 32),
+    0xd4: ('PowerNoise', 4),
+    0xd5: ('Dave', 6),
+    0xd6: ('NDS', 16),
+    0xd7: ('Game Boy Advance (direct)', 2),
+    0xd8: ('Game Boy Advance (MinMod)', 16),
+    0xd9: ('Bifurcator', 4),
+    0xda: ('SCSP', 32),
+    0xdb: ('YMF271 (OPX)', 48),
+    0xdc: ('RF5C400', 32),
+    0xdd: ('YM2612 XGM', 9),
+    0xde: ('YM2610B extended', 19),
+    0xdf: ('YM2612 XGM extended', 13),
+    0xe0: ('QSound', 19),
+    0xe1: ('PS1', 24),
+    0xe2: ('C64 (6581) with PCM', 4),
+    0xe3: ('Watara Supervision', 4),
+    0xe4: ('Namco Pole Position WSG', 8),
+    0xe5: ('µPD1771C-017', 4),
+    0xe7: ('klattsch', 1),
+    0xf0: ('SID2', 3),
+    0xf1: ('5E01', 5),
+    0xf5: ('SID3', 7),
+    0xfc: ('Pong', 1),
+    0xfd: ('Dummy System', 8),
+}
+# legacy ids that stand for two chips (or a renamed one): id -> [(chip, channels), ...]
+FUR_COMPOUND = {0x02: [(0x83, 6), (0x03, 4)], 0x42: [(0xa0, 9), (0x03, 4)],
+                0x08: [(0x82, 8), (0x9b, 5)], 0x43: [(0x03, 4), (0x89, 9)],
+                0x46: [(0x06, 5), (0x9d, 6)], 0x09: [(0xa5, 13)], 0x49: [(0xa6, 16)],
+                0xa9: [(0x9b, 5)]}
+FUR_NOTE_OFF, FUR_NOTE_REL, FUR_MACRO_REL = 'OFF', 'REL', 'MREL'
+
+
+class FurError(ValueError):
+    pass
+
+
+class _FurReader:
+    def __init__(self, d, p=0):
+        self.d, self.p = d, p
+
+    def seek(self, p):
+        if not 0 <= p <= len(self.d):
+            raise FurError('pointer %d is outside the file' % p)
+        self.p = p
+
+    def _un(self, fmt, n):
+        if self.p + n > len(self.d):
+            raise FurError('file ends early (reading at %d)' % self.p)
+        v = struct.unpack_from(fmt, self.d, self.p)[0]
+        self.p += n
+        return v
+
+    def u8(self): return self._un('<B', 1)
+    def s8(self): return self._un('<b', 1)
+    def u16(self): return self._un('<H', 2)
+    def s16(self): return self._un('<h', 2)
+    def u32(self): return self._un('<I', 4)
+    def s32(self): return self._un('<i', 4)
+    def f32(self): return self._un('<f', 4)
+
+    def magic(self):
+        if self.p + 4 > len(self.d):
+            raise FurError('file ends early')
+        v = self.d[self.p:self.p + 4]
+        self.p += 4
+        return v
+
+    def cstr(self):
+        e = self.d.find(b'\0', self.p)
+        if e < 0:
+            raise FurError('unterminated string')
+        s = self.d[self.p:e].decode('utf-8', 'replace')
+        self.p = e + 1
+        return s
+
+
+class FurSubsong:
+    pass
+
+
+class FurModule:
+    """chips: [dict(id, name, nch, first, flags)]; chan_chip[ch] = (chip index, channel in chip);
+    subsongs: [FurSubsong(hz, speeds, vtempo, pat_len, orders[ch][pos], effect_cols, hilight,
+    name)]; patterns[(subsong, ch, index)] = {row: (note, ins, vol, [(fx, val), ...])}.
+    note is 0..179 (0 = C-(-5), 60 = C-0) or FUR_NOTE_OFF / FUR_NOTE_REL / FUR_MACRO_REL."""
+
+
+def _fur_chip_list(ids_counts):
+    chips, first = [], 0
+    for cid, n in ids_counts:
+        for real, rn in FUR_COMPOUND.get(cid, [(cid, n)]):
+            name = FUR_CHIPS.get(real, ('chip 0x%02x' % real, rn))[0]
+            chips.append(dict(id=real, name=name, nch=rn, first=first, flags={}))
+            first += rn
+    return chips
+
+
+def _fur_flags(text):
+    out = {}
+    for line in text.splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def read_fur(data):
+    """parse a .fur file (bytes) into a FurModule"""
+    if not data.startswith(FUR_MAGIC):
+        try:
+            data = zlib.decompress(data)
+        except zlib.error:
+            raise FurError('not a Furnace module')
+        if not data.startswith(FUR_MAGIC):
+            raise FurError('not a Furnace module')
+    r = _FurReader(data, 16)
+    f = FurModule()
+    f.version = ver = r.u16()
+    r.u16()
+    info = r.u32()
+    r.seek(info)
+    f.subsongs, f.patterns, f.ins_ptrs, f.wave_ptrs, f.sample_ptrs = [], {}, [], [], []
+    f.compat1 = f.compat2 = f.compat3 = None
+    f.linear_pitch = None
+    f.meta, f.comment, f.master_vol, f.patchbay, f.patchbay_auto, f.grooves = [''] * 6, '', 1.0, [], 1, []
+    sub_ptrs, pat_ptrs, flag_ptrs = [], [], []
+    old_flags = []
+    if ver >= 240:
+        if r.magic() != b'INF2':
+            raise FurError('no INF2 block')
+        r.u32()
+        f.name, f.author = r.cstr(), r.cstr()
+        f.meta = [r.cstr() for _ in range(6)]
+        f.tuning = r.f32()
+        r.u8()
+        f.master_vol = r.f32()
+        f.chans = r.u16()
+        nchips = r.u16()
+        ids = []
+        outs = []
+        for _ in range(nchips):
+            cid, n = r.u16(), r.u16()
+            outs.append((r.f32(), r.f32(), r.f32()))
+            ids.append((cid, n))
+        f.chips = _fur_chip_list(ids)
+        for c, o in zip(f.chips, outs):
+            c['vol'], c['pan'], c['panfr'] = o
+        f.patchbay = [r.u32() for _ in range(r.u32())]
+        f.patchbay_auto = r.u8()
+        while True:
+            et = r.u8()
+            if et == 0:
+                break
+            ptrs = [r.u32() for _ in range(r.u32())]
+            if et == 1:
+                sub_ptrs = ptrs
+            elif et == 2:
+                flag_ptrs = ptrs
+            elif et == 4:
+                f.ins_ptrs = ptrs
+            elif et == 5:
+                f.wave_ptrs = ptrs
+            elif et == 6:
+                f.sample_ptrs = ptrs
+            elif et == 7:
+                pat_ptrs = ptrs
+    else:
+        if r.magic() != b'INFO':
+            raise FurError('no INFO block')
+        info_size = r.u32()
+        info_body = r.p
+        s = FurSubsong()
+        time_base = r.u8()
+        sp1, sp2 = r.u8(), r.u8()
+        r.u8()
+        s.hz = r.f32()
+        s.pat_len, s.ord_len = r.u16(), r.u16()
+        s.hilight = (r.u8(), r.u8())
+        n_ins, n_wave, n_smp, n_pat = r.u16(), r.u16(), r.u16(), r.u32()
+        ids = [r.u8() for _ in range(32)]
+        legacy = [c for c in ids if c]
+        # Furnace stops at the last non-empty slot; ids after a gap still count
+        last = max([i for i, c in enumerate(ids) if c], default=-1)
+        legacy = [c for c in ids[:last + 1]]
+        old_vol = [r.s8() / 64.0 for _ in range(32)]
+        old_pan = [r.s8() / 127.0 for _ in range(32)]
+        old_flags = [r.u32() for _ in range(32)]
+        f.chips = _fur_chip_list([(c, FUR_CHIPS.get(c, ('', 0))[1] or
+                                   sum(n for _, n in FUR_COMPOUND.get(c, [])))
+                                  for c in legacy if c])
+        slot_of = []
+        for i, c in enumerate(legacy):
+            if c:
+                slot_of += [i] * len(FUR_COMPOUND.get(c, [None]))
+        for k, c in enumerate(f.chips):
+            sl = slot_of[k] if k < len(slot_of) else 0
+            c['vol'], c['pan'], c['panfr'] = old_vol[sl], old_pan[sl], 0.0
+            if ver < 59 and c['id'] == 0x06:
+                c['vol'] /= 4
+        f.chans = sum(c['nch'] for c in f.chips)
+        f.name, f.author = r.cstr(), r.cstr()
+        f.tuning = r.f32()
+        f.compat1 = bytes(r.u8() for _ in range(20))       # compat flags (or reserved)
+        f.ins_ptrs = [r.u32() for _ in range(n_ins)]
+        f.wave_ptrs = [r.u32() for _ in range(n_wave)]
+        f.sample_ptrs = [r.u32() for _ in range(n_smp)]
+        pat_ptrs = [r.u32() for _ in range(n_pat)]
+        s.orders = [[r.u8() for _ in range(s.ord_len)] for _ in range(f.chans)]
+        s.effect_cols = [r.u8() for _ in range(f.chans)]
+        s.chan_names = [''] * f.chans
+        s.chan_short = [''] * f.chans
+        s.chan_show = [3] * f.chans
+        s.chan_collapse = [0] * f.chans
+        f.comment = ''
+        if ver >= 39:
+            s.chan_show = [r.u8() for _ in range(f.chans)]
+            if ver < 189:
+                s.chan_show = [(1 if v else 0) | (2 if v else 0) for v in s.chan_show]
+            s.chan_collapse = [r.u8() for _ in range(f.chans)]
+            if ver < 92:
+                s.chan_collapse = [3 if v else 0 for v in s.chan_collapse]
+            s.chan_names = [r.cstr() for _ in range(f.chans)]
+            s.chan_short = [r.cstr() for _ in range(f.chans)]
+            f.comment = r.cstr()
+        f.master_vol = r.f32() if ver >= 59 else 2.0
+        f.compat2 = bytes(r.u8() for _ in range(28)) if ver >= 70 else None   # extended compat flags
+        vt = (r.u16(), r.u16())
+        s.vtempo = vt if ver >= 96 else (150, 150)
+        s.name = s.comment = ''
+        if ver >= 95:
+            s.name = r.cstr()
+            s.comment = r.cstr()
+            n_sub = r.u8()
+            r.u8(); r.u8(); r.u8()
+            sub_ptrs = [r.u32() for _ in range(n_sub)]
+        f.meta = [''] * 6
+        if ver >= 103:
+            f.meta = [r.cstr() for _ in range(6)]       # system name, album, and Japanese ones
+        f.patchbay, f.patchbay_auto = [], 1
+        if ver >= 135:
+            for c in f.chips:
+                c['vol'], c['pan'], c['panfr'] = r.f32(), r.f32(), r.f32()
+            f.patchbay = [r.u32() for _ in range(r.u32())]
+        if ver >= 136:
+            f.patchbay_auto = r.u8()
+        f.compat3 = bytes(r.u8() for _ in range(8)) if ver >= 138 else None
+        speeds = [sp1, sp2]
+        if ver >= 139:
+            n = r.u8()
+            sp = [r.u8() for _ in range(16)]
+            speeds = sp[:max(1, min(16, n))]
+        s.speeds = [v * (time_base + 1) for v in speeds]
+        s.time_base, s.raw_speeds = time_base, speeds
+        f.grooves = []
+        if ver >= 139:
+            for _ in range(r.u8()):
+                n = r.u8()
+                f.grooves.append((n, bytes(r.u8() for _ in range(16))))
+        if ver >= 156:
+            r.u32(); r.u32(); r.u32()                # asset directories
+        if ver >= 100 and info_size and r.p > info_body + info_size:     # (extra bytes: ignored, as Furnace does)
+            raise FurError('INFO block is %d bytes, but %d were read' % (info_size, r.p - info_body))
+        f.subsongs.append(s)
+        flag_ptrs = old_flags if ver >= 119 else []
+    # chip flags
+    for i, c in enumerate(f.chips):
+        if i < len(flag_ptrs) and flag_ptrs[i]:
+            r.seek(flag_ptrs[i])
+            if r.magic() == b'FLAG':
+                r.u32()
+                c['flags'] = _fur_flags(r.cstr())
+        elif ver < 119 and i < len(old_flags):
+            o = old_flags[i]
+            if c['id'] == 0x80:
+                c['flags'] = {'chipType': str((o >> 4) & 3)}
+            elif c['id'] == 0x8c:
+                c['flags'] = {'channels': str((o >> 4) & 7)}
+    f.chan_chip = []
+    for k, c in enumerate(f.chips):
+        f.chan_chip += [(k, j) for j in range(c['nch'])]
+    if len(f.chan_chip) != f.chans:
+        raise FurError('chip channel counts (%d) do not add up to the song\'s %d channels'
+                       % (len(f.chan_chip), f.chans))
+    # subsongs
+    for p in sub_ptrs:
+        r.seek(p)
+        mg = r.magic()
+        r.u32()
+        s = FurSubsong()
+        if mg == b'SNG2':
+            s.hz = r.f32()
+            r.u8(); r.u8()
+            s.pat_len, s.ord_len = r.u16(), r.u16()
+            s.hilight = (r.u8(), r.u8())
+            s.vtempo = (r.u16(), r.u16())
+            n = r.u8()
+            sp = [r.u16() for _ in range(16)]
+            s.speeds = sp[:max(1, min(16, n))]
+            s.name = r.cstr()
+            s.comment = r.cstr()
+            s.orders = [[r.u8() for _ in range(s.ord_len)] for _ in range(f.chans)]
+            s.effect_cols = [r.u8() for _ in range(f.chans)]
+            s.chan_show = [r.u8() for _ in range(f.chans)]
+            s.chan_collapse = [r.u8() for _ in range(f.chans)]
+            s.chan_names = [r.cstr() for _ in range(f.chans)]
+            s.chan_short = [r.cstr() for _ in range(f.chans)]
+        elif mg == b'SONG':
+            tb = r.u8()
+            sp1, sp2 = r.u8(), r.u8()
+            r.u8()
+            s.hz = r.f32()
+            s.pat_len, s.ord_len = r.u16(), r.u16()
+            s.hilight = (r.u8(), r.u8())
+            vt = (r.u16(), r.u16())
+            s.vtempo = vt if ver >= 96 else (150, 150)
+            s.name = r.cstr()
+            s.comment = r.cstr()
+            s.orders = [[r.u8() for _ in range(s.ord_len)] for _ in range(f.chans)]
+            s.effect_cols = [r.u8() for _ in range(f.chans)]
+            s.chan_show = [r.u8() for _ in range(f.chans)]
+            if ver < 189:
+                s.chan_show = [(1 if v else 0) | (2 if v else 0) for v in s.chan_show]
+            s.chan_collapse = [r.u8() for _ in range(f.chans)]
+            s.chan_names = [r.cstr() for _ in range(f.chans)]
+            s.chan_short = [r.cstr() for _ in range(f.chans)]
+            speeds = [sp1, sp2]
+            if ver >= 139:
+                n = r.u8()
+                sp = [r.u8() for _ in range(16)]
+                speeds = sp[:max(1, min(16, n))]
+            s.speeds = [v * (tb + 1) for v in speeds]
+            s.time_base, s.raw_speeds = tb, speeds
+        else:
+            raise FurError('subsong pointer does not point at a subsong')
+        f.subsongs.append(s)
+    if not f.subsongs:
+        raise FurError('the module has no songs')
+    if f.compat1:
+        f.linear_pitch = f.compat1[1]
+    # instruments, wavetables and samples are kept as raw blocks (a writer copies them)
+    def raw_block(p):
+        r.seek(p)
+        mg = r.magic()
+        size = r.u32()
+        if p + 8 + size > len(data):
+            raise FurError('%s block runs past the end of the file' % mg.decode('latin1'))
+        return data[p:p + 8 + size]
+    f.ins_raw = [raw_block(p) for p in f.ins_ptrs]
+    f.wave_raw = [raw_block(p) for p in f.wave_ptrs]
+    f.sample_raw = [raw_block(p) for p in f.sample_ptrs]
+    f.ins_types = []
+    for b in f.ins_raw:
+        f.ins_types.append(struct.unpack_from('<B', b, 10)[0] if b[:4] == b'INS2' else None)
+    f.flag_text = []
+    for c in f.chips:
+        f.flag_text.append(''.join('%s=%s\n' % kv for kv in c['flags'].items()))
+    for s in f.subsongs:
+        s.vtempo = (max(1, s.vtempo[0]), max(1, s.vtempo[1]))
+        s.speeds = [max(1, v) for v in s.speeds] or [6]
+    # patterns
+    for p in pat_ptrs:
+        r.seek(p)
+        mg = r.magic()
+        psize = r.u32()
+        pbody = r.p
+        rows = {}
+        if mg == b'PATN':
+            sub, ch, idx = r.u8(), r.u8(), r.u16()
+            r.cstr()
+            if sub >= len(f.subsongs) or ch >= f.chans:
+                raise FurError('pattern for a channel or subsong that does not exist')
+            plen = f.subsongs[sub].pat_len
+            j = 0
+            while j < plen:
+                mask = r.u8()
+                if mask == 0xFF:
+                    break
+                if mask & 128:
+                    j += (mask & 127) + 2
+                    continue
+                em = 0
+                if mask & 32:
+                    em |= r.u8()
+                if mask & 64:
+                    em |= r.u8() << 8
+                if mask & 8:
+                    em |= 1
+                if mask & 16:
+                    em |= 2
+                note = ins = vol = None
+                if mask & 1:
+                    n = r.u8()
+                    if n == 180:
+                        note = FUR_NOTE_OFF
+                    elif n == 181:
+                        note = FUR_NOTE_REL
+                    elif n == 182:
+                        note = FUR_MACRO_REL
+                    elif n == 183:
+                        r.u32()                      # raw frequency: not a note
+                    elif n < 180:
+                        note = n
+                if mask & 2:
+                    ins = r.u8()
+                if mask & 4:
+                    vol = r.u8()
+                raw = {}
+                for k in range(16):
+                    if em & (1 << k):
+                        raw[k] = r.u8()
+                fx = [(raw.get(2 * k), raw.get(2 * k + 1)) for k in range(8)]
+                while fx and fx[-1] == (None, None):
+                    fx.pop()                         # effect slots keep their column
+                if note is not None or ins is not None or vol is not None or fx:
+                    rows[j] = (note, ins, vol, fx)
+                j += 1
+        elif mg == b'PATR':
+            ch, idx = r.u16(), r.u16()
+            sub = r.u16() if ver >= 95 else (r.u16() * 0)
+            r.u16()
+            if sub >= len(f.subsongs) or ch >= f.chans:
+                raise FurError('pattern for a channel or subsong that does not exist')
+            s = f.subsongs[sub]
+            for j in range(s.pat_len):
+                n, o = r.s16(), r.s16()
+                ins, vol = r.s16(), r.s16()
+                fx = []
+                for _ in range(s.effect_cols[ch]):
+                    a, b = r.s16(), r.s16()
+                    fx.append((a if a >= 0 else None, b if b >= 0 else None))
+                while fx and fx[-1] == (None, None):
+                    fx.pop()
+                if n == 100:
+                    note = FUR_NOTE_OFF
+                elif n == 101:
+                    note = FUR_NOTE_REL
+                elif n == 102:
+                    note = FUR_MACRO_REL
+                elif n == 0 and o == 0:
+                    note = None
+                else:
+                    if n == 0:
+                        n, o = 12, o - 1
+                    v = n + ((o + 128) % 256 - 128) * 12 + 60
+                    note = v if 0 <= v < 180 else None
+                ins = ins if ins >= 0 else None
+                vol = vol if vol >= 0 else None
+                if note is not None or ins is not None or vol is not None or fx:
+                    rows[j] = (note, ins, vol, fx)
+            if ver >= 51:
+                r.cstr()                             # pattern name
+        else:
+            raise FurError('pattern pointer does not point at a pattern')
+        if ver >= 100 and psize:
+            left = pbody + psize - r.p
+            # Furnace writes a trailing 0xFF it never reads back; some converters (ghx2fur)
+            # declare every block 4 bytes too long.  Only reading past the block is an error.
+            if left < 0:
+                raise FurError('%s block is %d bytes, but %d were read'
+                               % (mg.decode(), psize, r.p - pbody))
+        f.patterns[(sub, ch, idx)] = rows
+    return f
+
+
+def describe_fur(f):
+    lines = ['Furnace module version %d: "%s" by %s' % (f.version, f.name, f.author or '?')]
+    for c in f.chips:
+        extra = ''
+        if c['id'] == 0x80 and c['flags'].get('chipType') == '2':
+            extra = ' (Sunsoft 5B)'
+        lines.append('  chip %-24s %2d channels (song channels %d-%d)%s'
+                     % (c['name'], c['nch'], c['first'], c['first'] + c['nch'] - 1, extra))
+    for i, s in enumerate(f.subsongs):
+        used = sum(1 for k in f.patterns if k[0] == i)
+        lines.append('  song %d "%s": %d orders x %d rows, speed %s at %.4g Hz, virtual tempo %d/%d, '
+                     'highlight %d/%d, %d patterns' % (i, s.name, s.ord_len, s.pat_len,
+                     '/'.join(map(str, s.speeds)), s.hz, s.vtempo[0], s.vtempo[1],
+                     s.hilight[0], s.hilight[1], used))
+    return '\n'.join(lines)
+
+
+# ---- NES-family chips: Furnace song -> FamiTracker raw text (one row per frame) ----------
+# FamiTracker channel order (EXPANSION_LAYOUT): 2A03, VRC6, MMC5, N163, FDS, VRC7, 5B.
+# (Furnace chip id -> FT expansion bit, FT chip name, Furnace channels kept)
+FUR_FT_CHIPS = {0x06: (0, '2A03', 5), 0xf1: (0, '2A03', 5), 0x88: (1, 'VRC6', 3),
+                0x8b: (8, 'MMC5', 2), 0x8c: (16, 'N163', None), 0x8a: (4, 'FDS', 1),
+                0x9d: (2, 'VRC7', 6)}
+FT_CHIP_ORDER = ['2A03', 'VRC6', 'MMC5', 'N163', 'FDS', 'VRC7', 'S5B']
+# Furnace effect -> FamiTracker effect letter (inverse of Furnace's own .ftm importer,
+# src/engine/fileOps/ftm.cpp ftEffectMap)
+FUR_FT_EFFECTS = {0x00: '0', 0x01: '1', 0x02: '2', 0x03: '3', 0x04: '4', 0x07: '7', 0x0A: 'A',
+                  0x0B: 'B', 0x0D: 'D', 0x0F: 'F', 0xFD: 'F', 0x12: 'V', 0x13: 'H', 0x14: 'I',
+                  0xE1: 'Q', 0xE2: 'R', 0xE5: 'P', 0xEC: 'S', 0xED: 'G', 0xFF: 'C', 0xFC: 'L',
+                  0xE6: 'T', 0x09: 'O'}
+
+
+def fur_ft_layout(f):
+    """[(fur channel, ft chip, kind index)] in FamiTracker order, the expansion bits and the
+    N163 channel count - or raise FurError naming the chips FamiTracker can't play"""
+    found, bad = {}, []
+    for k, c in enumerate(f.chips):
+        if c['id'] == 0x80 and c['flags'].get('chipType') == '2':
+            name, n, bit = 'S5B', 3, 32
+        elif c['id'] in FUR_FT_CHIPS:
+            bit, name, n = FUR_FT_CHIPS[c['id']]
+            if n is None:
+                n = (int(c['flags'].get('channels', 7)) & 7) + 1
+        else:
+            bad.append(c['name'])
+            continue
+        if name in found:
+            bad.append('a second ' + c['name'])
+            continue
+        found[name] = (k, n, bit)
+    if bad or '2A03' not in found:
+        raise FurError('FamiTracker output needs NES chips only (2A03 plus VRC6, VRC7, FDS, MMC5, '
+                       'N163, Sunsoft 5B); this song has %s' % ', '.join(bad or ['no 2A03']))
+    layout, exp = [], 0
+    for name in FT_CHIP_ORDER:
+        if name in found:
+            k, n, bit = found[name]
+            exp |= bit
+            layout += [(f.chips[k]['first'] + j, name, j) for j in range(n)]
+    n163 = found['N163'][1] if 'N163' in found else None
+    return layout, exp, n163
+
+
+def _fur_cell_text(cell, chip, j, ncols, stats):
+    note, ins, vol, fx = cell if cell else (None, None, None, [])
+    if note is None:
+        nt = '...'
+    elif note == FUR_NOTE_OFF:
+        nt = '---'
+    elif note in (FUR_NOTE_REL, FUR_MACRO_REL):
+        nt = '==='
+    else:
+        n = note - 60 + (24 if chip == 'FDS' else 0)
+        if chip == '2A03' and j == 3:
+            nt = '%X-#' % (n & 15)
+        else:
+            n = max(0, min(95, n))
+            nt = '%s%d' % (NOTE_NAMES[n % 12], n // 12)
+    it = '..' if ins is None or nt in ('...', '---', '===') and ins is None else '%02X' % FT_CHIP_ORDER.index(chip)
+    if nt in ('---', '==='):
+        it = '..'
+    if vol is None:
+        vt = '.'
+    else:
+        if chip == 'VRC6' and j == 2:
+            vol = (vol * 15 + 21) // 42
+        elif chip == 'FDS':
+            vol = (vol * 15 + 15) // 31
+        vt = '%X' % max(0, min(15, vol))
+    effs = []
+    for a, b in fx:
+        if a is None:
+            continue
+        b = b or 0
+        letter = FUR_FT_EFFECTS.get(a)
+        if a == 0x10 and chip == 'N163':
+            letter = 'V'
+        if a == 0x11 and chip == '2A03' and j == 4:
+            letter = 'Z'
+        if letter is None:
+            stats[a] += 1
+            continue
+        if a == 0x0F and b > 0x1F:
+            b = 0x1F
+        effs.append('%s%02X' % (letter, b & 0xFF))
+    effs = (effs + ['...'] * ncols)[:ncols]
+    return ' '.join([nt, it, vt] + effs)
+
+
+def fur_to_ft_text(f, subsong=0, log=print):
+    """the song as a FamiTracker text export at one row per frame (as nsfimport writes it):
+    rows are expanded to frames from the speed, the tick rate and the virtual tempo, jumps
+    and skips are followed, and a loop ends in Bxx back to its first row"""
+    layout, exp, n163 = fur_ft_layout(f)
+    s = f.subsongs[subsong]
+    pal = abs(s.hz - 50) < 1
+    frame_hz = 50.0 if pal else 60.0
+    tick_hz = s.hz * s.vtempo[0] / float(s.vtempo[1])
+    per_tick = frame_hz / tick_hz
+    ncols = [min(4, max(1, s.effect_cols[fc])) for fc, _, _ in layout]
+    stats = collections.Counter()
+    frames, start_of, loop_tick = [], {}, None
+    speeds = list(s.speeds)
+    oi, r, row_no, t_acc, guard = 0, 0, 0, 0.0, 0
+    while oi < s.ord_len and guard < 200000:
+        guard += 1
+        if r == 0:
+            if oi in start_of:
+                loop_tick = start_of[oi]
+                break
+            start_of[oi] = len(frames)
+        cells = [f.patterns.get((subsong, fc, s.orders[fc][oi]), {}).get(r) for fc, _, _ in layout]
+        jump = skip = None
+        halt = False
+        for fc in range(f.chans):
+            cell = f.patterns.get((subsong, fc, s.orders[fc][oi]), {}).get(r)
+            for a, b in (cell[3] if cell else []):
+                b = b or 0
+                if a == 0x0B:
+                    jump = b
+                elif a == 0x0D:
+                    skip = b
+                elif a == 0xFF:
+                    halt = True
+                elif a == 0x0F and b:
+                    speeds = [b]
+                elif a == 0x09 and b:
+                    speeds = [b]
+        ticks = speeds[row_no % len(speeds)]
+        row_no += 1
+        t_acc += ticks * per_tick
+        nfr = int(round(t_acc)) - 0
+        t_acc -= nfr
+        texts = []
+        for (fc, chip, j), cell, nc in zip(layout, cells, ncols):
+            if cell:
+                cell = (cell[0], cell[1], cell[2], [(a, b) for a, b in cell[3] if a not in (0x0B, 0x0D, 0xFF, 0x0F, 0x09)])
+            texts.append(_fur_cell_text(cell, chip, j, nc, stats))
+        if nfr > 0:
+            frames.append(texts)
+            blank = [_fur_cell_text(None, chip, j, nc, stats) for (fc, chip, j), nc in zip(layout, ncols)]
+            frames += [list(blank) for _ in range(nfr - 1)]
+        if halt:
+            break
+        if jump is not None:
+            if jump in start_of:
+                loop_tick = start_of[jump]
+                break
+            oi, r = jump, 0
+            continue
+        if skip is not None:
+            oi, r = oi + 1, 0
+            continue
+        r += 1
+        if r >= s.pat_len:
+            oi, r = oi + 1, 0
+    # a song that just runs off its last order wraps to the start in Furnace; that is usually a
+    # rip of several passes of the game's loop, so no loop is marked and the retrace finds it
+    if stats:
+        log('Furnace effects with no FamiTracker equivalent were left out: %s'
+            % ', '.join('%02Xxx (%d)' % (a, n) for a, n in stats.most_common()))
+    if abs(per_tick - 1) > 1e-6 or speeds != [1] or s.speeds != [1]:
+        log('the song runs at %.4g ticks per second with speed %s: rows were expanded to %g Hz frames'
+            % (tick_hz, '/'.join(map(str, s.speeds)), frame_hz))
+    # patterns: intro, then the loop, each in 256-row patterns; D00 ends a short one, Bxx loops
+    PL = 256
+    secs = [(0, loop_tick), (loop_tick, len(frames))] if loop_tick else [(0, len(frames))]
+    chunks, loop_order = [], 0
+    for a, b in secs:
+        if a == loop_tick and loop_tick:
+            loop_order = len(chunks)
+        for i in range(a, b, PL):
+            chunks.append(frames[i:min(b, i + PL)])
+    def add_fx(row, code):
+        for k, (txt, nc) in enumerate(zip(row, ncols)):
+            parts = txt.split(' ')
+            for e in range(3, 3 + nc):
+                if parts[e] == '...':
+                    parts[e] = code
+                    row[k] = ' '.join(parts)
+                    return
+    for i, ch in enumerate(chunks):
+        if len(ch) < PL and not (i == len(chunks) - 1 and loop_tick is not None):
+            add_fx(ch[-1], 'D00')            # a short pattern (also the last one of a song that just ends)
+    if loop_tick is not None and chunks:
+        add_fx(chunks[-1][-1], 'B%02X' % loop_order)
+    nch = len(layout)
+    out = ['# FamiTracker text export (made from a Furnace module by retrace_mod.py)', '',
+           '# INFO block', 'TITLE           "%s"' % f.name.replace('"', "'")[:31],
+           'AUTHOR          "%s"' % f.author.replace('"', "'")[:31], 'COPYRIGHT       ""', '',
+           '# PARAMS block', 'MACHINE         %d' % (1 if pal else 0), 'FRAMERATE       0',
+           'EXPANSION       %d' % exp, 'VIBRATO         1', 'SPLIT           21']
+    if n163:
+        out.append('N163CHANNELS    %d' % n163)
+    out += ['', '# INSTRUMENTS block']
+    chips_used = []
+    for fc, chip, j in layout:
+        if chip not in chips_used:
+            chips_used.append(chip)
+    for chip in chips_used:
+        i = FT_CHIP_ORDER.index(chip)
+        if chip in ('2A03', 'MMC5'):
+            out.append('INST2A03 %3d    -1  -1  -1  -1  -1 "blank %s"' % (i, chip))
+        elif chip == 'VRC6':
+            out.append('INSTVRC6 %3d    -1  -1  -1  -1  -1 "blank VRC6"' % i)
+        elif chip == 'S5B':
+            out.append('INSTS5B  %3d    -1  -1  -1  -1  -1 "blank 5B"' % i)
+        elif chip == 'N163':
+            out.append('INSTN163 %3d    -1  -1  -1  -1  -1  32   0   1 "N163 (wave not converted)"' % i)
+            out.append('N163WAVE %3d   0 : ' % i + ' '.join(str(v) for v in
+                       [8, 10, 12, 13, 14, 15, 15, 15, 15, 15, 15, 14, 13, 12, 10, 8,
+                        7, 5, 3, 2, 1, 0, 0, 0, 0, 0, 0, 1, 2, 3, 5, 7]))
+        elif chip == 'VRC7':
+            out.append('INSTVRC7 %3d     1 00 00 00 00 00 00 00 00 "VRC7 (patch not converted)"' % i)
+        elif chip == 'FDS':
+            out.append('INSTFDS  %3d     0   0   0   0 "FDS (wave not converted)"' % i)
+            out.append('FDSWAVE  %3d : ' % i + ' '.join(['32'] * 32 + ['0'] * 32))
+            out.append('FDSMOD   %3d : ' % i + ' '.join(['0'] * 32))
+    if any(c in chips_used for c in ('N163', 'FDS', 'VRC7')):
+        log('N163 / FDS / VRC7 instruments are not converted yet: those channels keep their notes, '
+            'volumes and effects but play a placeholder sound')
+    out += ['', '# track HEADER block', 'TRACK %3d   1 %3d "%s"' % (PL, 150 if not pal else 125,
+                                                                    (s.name or 'Furnace song')[:31]),
+            'COLUMNS : ' + ' '.join(str(c) for c in ncols), '', '# track FRAMES block']
+    for i in range(len(chunks)):
+        out.append('ORDER %02X : ' % i + ' '.join('%02X' % i for _ in range(nch)))
+    out += ['', '# track PATTERNS block']
+    for i, ch in enumerate(chunks):
+        out.append('PATTERN %02X' % i)
+        for rr, row in enumerate(ch):
+            out.append('ROW %02X : ' % rr + ' : '.join(row))
+        out.append('')
+    out.append('# End of export')
+    return pad_n163_text('\r\n'.join(out) + '\r\n', exp, n163)
+
+
+_FUR_CACHE = {}
+
+
+def parse_fur(data, subsong=0, log=print):
+    """read a .fur and return the module the retrace works on (NES-family chips only)"""
+    key = (hash(bytes(data)), subsong)
+    if key in _FUR_CACHE:
+        return _FUR_CACHE[key]
+    f = read_fur(data)
+    if subsong >= len(f.subsongs):
+        raise FurError('the module has %d song(s); there is no song %d' % (len(f.subsongs), subsong))
+    m = parse_module(fur_to_ft_text(f, subsong, log))
+    m.num_subsongs = len(f.subsongs)
+    m.track_names = [s.name or 'Song %d' % (i + 1) for i, s in enumerate(f.subsongs)]
+    m.furnace = f
+    _FUR_CACHE[key] = m
+    return m
+
+
+# ----------------------------------------------------------------------------
+# Furnace .fur writer (format version 232 = Furnace 0.6.8.3, the old INFO layout)
+# ----------------------------------------------------------------------------
+# Mirrors DivEngine::saveFur of Furnace 0.6.8.3 field by field.  0.6.8.x cannot open the
+# newer INF2 layout (version >= 240), so this one is written for the widest audience.
+FUR_WRITE_VERSION = 232
+# a new Furnace 0.6.8.3 song's compatibility flags (DivSong's constructor), in file order
+FUR_COMPAT1_DEFAULT = bytes([0, 2, 2, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1])
+FUR_COMPAT2_DEFAULT = bytes([0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 4, 0, 0, 1, 1, 0, 0, 0, 0,
+                             2, 0, 1, 0, 0, 0])
+FUR_COMPAT3_DEFAULT = bytes(8)
+# Furnace's .ftm importer sets linear pitch off (FamiTracker periods); everything else default
+FUR_COMPAT1_FTM = bytes([0, 0]) + FUR_COMPAT1_DEFAULT[2:]
+
+
+class _FurWriter:
+    def __init__(self):
+        self.b = bytearray()
+
+    def tell(self):
+        return len(self.b)
+
+    def u8(self, v): self.b += struct.pack('<B', v & 0xFF)
+    def s8(self, v): self.b += struct.pack('<b', v)
+    def u16(self, v): self.b += struct.pack('<H', v & 0xFFFF)
+    def u32(self, v): self.b += struct.pack('<I', v & 0xFFFFFFFF)
+    def f32(self, v): self.b += struct.pack('<f', v)
+    def raw(self, d): self.b += d
+
+    def cstr(self, s):
+        self.b += (s or '').encode('utf-8') + b'\0'
+
+    def put32(self, at, v):
+        struct.pack_into('<I', self.b, at, v & 0xFFFFFFFF)
+
+    def block(self, magic):
+        self.raw(magic)
+        at = self.tell()
+        self.u32(0)
+        return at
+
+    def end_block(self, at):
+        self.put32(at, self.tell() - at - 4)
+
+
+def fur_patn(sub, ch, idx, rows, pat_len):
+    """one PATN block: rows = {row: (note, ins, vol, [(fx, val), ...])}"""
+    w = _FurWriter()
+    at = w.block(b'PATN')
+    w.u8(sub)
+    w.u8(ch)
+    w.u16(idx)
+    w.cstr('')
+    empty = 0
+
+    def flush():
+        nonlocal empty
+        while empty > 0:
+            if empty == 1:
+                w.u8(0)
+                empty = 0
+            else:
+                n = min(empty, 128)              # 129 would encode as 0xFF, the end marker
+                w.u8(0x80 | (n - 2))
+                empty -= n
+
+    last = max([r for r in rows if r < pat_len], default=-1)
+    for j in range(last + 1):
+        cell = rows.get(j)
+        if not cell or (cell[0] is None and cell[1] is None and cell[2] is None and not cell[3]):
+            empty += 1
+            continue
+        flush()
+        note, ins, vol, fx = cell
+        fx = list(fx)[:8]
+        mask, ebits = 0, 0
+        if note is not None:
+            mask |= 1
+        if ins is not None:
+            mask |= 2
+        if vol is not None:
+            mask |= 4
+        for k, (a, v) in enumerate(fx):
+            if a is not None:
+                ebits |= 1 << (2 * k)
+            if v is not None:
+                ebits |= 1 << (2 * k + 1)
+        if ebits & ~3:
+            mask |= 32
+            if ebits & 0xFF00:
+                mask |= 64
+        else:
+            if ebits & 1:
+                mask |= 8
+            if ebits & 2:
+                mask |= 16
+        w.u8(mask)
+        if mask & 32:
+            w.u8(ebits & 0xFF)
+        if mask & 64:
+            w.u8((ebits >> 8) & 0xFF)
+        if note is not None:
+            w.u8({FUR_NOTE_OFF: 180, FUR_NOTE_REL: 181, FUR_MACRO_REL: 182}.get(note, note))
+        if ins is not None:
+            w.u8(ins)
+        if vol is not None:
+            w.u8(vol)
+        for k in range(16):
+            if ebits & (1 << k):
+                a, v = fx[k // 2]
+                w.u8(a if k % 2 == 0 else v)
+    w.u8(0xFF)
+    w.end_block(at)
+    return bytes(w.b)
+
+
+def fur_ins2(ins_type, name, macros=(), features=()):
+    """an INS2 instrument block.  macros: [dict(code, vals, loop=255, rel=255, mode=0,
+    speed=1, delay=0)] with Furnace's macro codes (0 vol, 1 arp, 2 duty, 3 wave, 4 pitch,
+    ...); features: [(two-letter code, payload bytes)] written as they are"""
+    w = _FurWriter()
+    at = w.block(b'INS2')
+    w.u16(FUR_WRITE_VERSION)
+    w.u8(ins_type)
+    w.u8(0)
+    w.raw(b'NA')
+    fa = w.tell()
+    w.u16(0)
+    w.cstr(name)
+    struct.pack_into('<H', w.b, fa, w.tell() - fa - 2)
+    ms = [m for m in macros if m.get('vals')]
+    if ms:
+        w.raw(b'MA')
+        fa = w.tell()
+        w.u16(0)
+        w.u16(8)
+        for m in ms:
+            vals = [int(v) for v in m['vals']][:255]
+            lo, hi = min(vals), max(vals)
+            if lo >= 0 and hi <= 255:
+                ws, fmt = 0, '<B'
+            elif lo >= -128 and hi <= 127:
+                ws, fmt = 64, '<b'
+            elif lo >= -32768 and hi <= 32767:
+                ws, fmt = 128, '<h'
+            else:
+                ws, fmt = 192, '<i'
+            w.u8(m['code'] & 31)
+            w.u8(len(vals))
+            w.u8(m.get('loop', 255))
+            w.u8(m.get('rel', 255))
+            w.u8(m.get('mode', 0))
+            w.u8((m.get('open', 1) & 0x3F) | ws)
+            w.u8(m.get('delay', 0))
+            w.u8(m.get('speed', 1))
+            for v in vals:
+                w.raw(struct.pack(fmt, v))
+        w.u8(0xFF)
+        struct.pack_into('<H', w.b, fa, w.tell() - fa - 2)
+    for code, payload in features:
+        w.raw(code)
+        w.u16(len(payload))
+        w.raw(payload)
+    w.raw(b'EN')
+    w.end_block(at)
+    return bytes(w.b)
+
+
+def fur_wave(data, height=15, name=''):
+    w = _FurWriter()
+    at = w.block(b'WAVE')
+    w.cstr(name)
+    w.u32(len(data))
+    w.u32(0)
+    w.u32(height)
+    for v in data:
+        w.raw(struct.pack('<i', int(v)))
+    w.end_block(at)
+    return bytes(w.b)
+
+
+def write_fur(song, version=None):
+    """bytes of a .fur from a FurModule-like object: name, author, tuning, chips [dict(id,
+    flags)], subsongs [FurSubsong], patterns {(sub, ch, idx): rows}, ins_raw / wave_raw /
+    sample_raw (complete blocks), compat1/2/3 (optional raw compat flag bytes)"""
+    chips = song.chips
+    nominal = []
+    for c in chips:
+        if c['id'] in FUR_COMPOUND or c['id'] not in FUR_CHIPS:
+            raise FurError('cannot write chip id 0x%02x' % c['id'])
+        nominal.append(FUR_CHIPS[c['id']][1])
+    chans = sum(nominal)
+    if len(chips) > 32:
+        raise FurError('Furnace allows at most 32 chips')
+    subs = song.subsongs
+    pats = []
+    for si, s in enumerate(subs):
+        for ch in range(chans):
+            seen = set()
+            for pos in range(s.ord_len):
+                idx = s.orders[ch][pos]
+                if idx not in seen:
+                    seen.add(idx)
+                    pats.append((si, ch, idx))
+    ins, waves, smps = list(song.ins_raw), list(getattr(song, 'wave_raw', [])), list(getattr(song, 'sample_raw', []))
+    if len(ins) > 256 or len(waves) > 256 or len(smps) > 256:
+        raise FurError('Furnace allows at most 256 instruments, wavetables and samples')
+    # Furnace decodes instruments with the SONG's version (it ignores the one inside INS2), so
+    # copied instruments stay exact only if the input's version is kept.  Versions 157..232 all
+    # share this layout.
+    if version is None:
+        version = getattr(song, 'version', FUR_WRITE_VERSION)
+        version = version if 157 <= version <= FUR_WRITE_VERSION else FUR_WRITE_VERSION
+    w = _FurWriter()
+    w.raw(FUR_MAGIC)
+    w.u16(version)
+    w.u16(0)
+    w.u32(32)
+    w.u32(0)
+    w.u32(0)
+    s0 = subs[0]
+
+    def tb_speeds(s):
+        """(time base, stored speeds): the original pair when the speeds are unchanged"""
+        tb, raw = getattr(s, 'time_base', 0), getattr(s, 'raw_speeds', None)
+        if raw and [v * (tb + 1) for v in raw] == list(s.speeds):
+            return tb, list(raw)
+        return 0, list(s.speeds)
+    tb0, sp0 = tb_speeds(s0)
+    info = w.block(b'INFO')
+    w.u8(tb0)                                     # time base
+    w.u8(sp0[0])
+    w.u8(sp0[1] if len(sp0) >= 2 else sp0[0])
+    w.u8(1)                                       # arpeggio speed
+    w.f32(s0.hz)
+    w.u16(s0.pat_len)
+    w.u16(s0.ord_len)
+    w.u8(s0.hilight[0])
+    w.u8(s0.hilight[1])
+    w.u16(len(ins))
+    w.u16(len(waves))
+    w.u16(len(smps))
+    w.u32(len(pats))
+    for i in range(32):
+        w.u8(chips[i]['id'] if i < len(chips) else 0)
+    for i in range(32):
+        v = chips[i].get('vol', 1.0) if i < len(chips) else 0.0
+        w.s8(max(-128, min(127, int(v * 64.0))))   # Furnace truncates these the same way
+    for i in range(32):
+        v = chips[i].get('pan', 0.0) if i < len(chips) else 0.0
+        w.s8(max(-128, min(127, int(v * 127.0))))
+    flag_at = w.tell()
+    for i in range(32):
+        w.u32(0)
+    w.cstr(song.name)
+    w.cstr(song.author)
+    w.f32(getattr(song, 'tuning', 440.0) or 440.0)
+    w.raw(getattr(song, 'compat1', None) or FUR_COMPAT1_DEFAULT)
+    ptr_at = w.tell()
+    for _ in range(len(ins) + len(waves) + len(smps) + len(pats)):
+        w.u32(0)
+    for ch in range(chans):
+        for pos in range(s0.ord_len):
+            w.u8(s0.orders[ch][pos])
+    for ch in range(chans):
+        w.u8(max(1, min(8, s0.effect_cols[ch])))
+    def chan_lists(s):
+        def get(name, default):
+            v = list(getattr(s, name, None) or [])
+            return (v + [default] * chans)[:chans]
+        return get('chan_show', 3), get('chan_collapse', 0), get('chan_names', ''), get('chan_short', '')
+    show, coll, names, short = chan_lists(s0)
+    for v in show:
+        w.u8(v if version >= 189 else (1 if v & 1 else 0))   # 1 shown, 2 shown in the oscilloscope
+    for v in coll:
+        w.u8(v)
+    for v in names:
+        w.cstr(v)
+    for v in short:
+        w.cstr(v)
+    w.cstr(getattr(song, 'comment', ''))
+    w.f32(getattr(song, 'master_vol', 1.0))
+    w.raw(getattr(song, 'compat2', None) or FUR_COMPAT2_DEFAULT)
+    w.u16(s0.vtempo[0])
+    w.u16(s0.vtempo[1])
+    w.cstr(s0.name)
+    w.cstr(getattr(s0, 'comment', ''))
+    w.u8(len(subs) - 1)
+    w.u8(0); w.u8(0); w.u8(0)
+    sub_at = w.tell()
+    for _ in range(len(subs) - 1):
+        w.u32(0)
+    for v in (list(getattr(song, 'meta', None) or []) + [''] * 6)[:6]:
+        w.cstr(v)                                 # system name, album, Japanese names
+    for c in chips:
+        w.f32(c.get('vol', 1.0)); w.f32(c.get('pan', 0.0)); w.f32(c.get('panfr', 0.0))
+    pb = list(getattr(song, 'patchbay', []) or [])
+    w.u32(len(pb))
+    for v in pb:
+        w.u32(v)
+    w.u8(getattr(song, 'patchbay_auto', 1))
+    w.raw(getattr(song, 'compat3', None) or FUR_COMPAT3_DEFAULT)
+    w.u8(min(16, len(sp0)))
+    sp = (sp0 + [0] * 16)[:16]
+    for v in sp:
+        w.u8(min(255, v))
+    gr = list(getattr(song, 'grooves', []) or [])
+    w.u8(len(gr))
+    for n, vals in gr:
+        w.u8(n)
+        w.raw(bytes(vals)[:16].ljust(16, b'\0'))
+    adir_at = w.tell()
+    w.u32(0); w.u32(0); w.u32(0)
+    w.end_block(info)
+    # more subsongs
+    for k, s in enumerate(subs[1:]):
+        w.put32(sub_at + 4 * k, w.tell())
+        at = w.block(b'SONG')
+        tb, sp = tb_speeds(s)
+        w.u8(tb)
+        w.u8(sp[0])
+        w.u8(sp[1] if len(sp) >= 2 else sp[0])
+        w.u8(1)
+        w.f32(s.hz)
+        w.u16(s.pat_len)
+        w.u16(s.ord_len)
+        w.u8(s.hilight[0]); w.u8(s.hilight[1])
+        w.u16(s.vtempo[0]); w.u16(s.vtempo[1])
+        w.cstr(s.name)
+        w.cstr(getattr(s, 'comment', ''))
+        for ch in range(chans):
+            for pos in range(s.ord_len):
+                w.u8(s.orders[ch][pos])
+        for ch in range(chans):
+            w.u8(max(1, min(8, s.effect_cols[ch])))
+        show, coll, names, short = chan_lists(s)
+        for v in show:
+            w.u8(v if version >= 189 else (1 if v & 1 else 0))
+        for v in coll:
+            w.u8(v)
+        for v in names:
+            w.cstr(v)
+        for v in short:
+            w.cstr(v)
+        w.u8(min(16, len(sp)))
+        for v in (sp + [0] * 16)[:16]:
+            w.u8(min(255, v))
+        w.end_block(at)
+    # chip flags
+    for i, c in enumerate(chips):
+        text = c.get('flag_text')
+        if text is None:
+            text = ''.join('%s=%s\n' % kv for kv in c.get('flags', {}).items())
+        w.put32(flag_at + 4 * i, w.tell())
+        at = w.block(b'FLAG')
+        w.cstr(text)
+        w.end_block(at)
+    # asset directories (Furnace seeks to all three, so they must exist)
+    for i in range(3):
+        w.put32(adir_at + 4 * i, w.tell())
+        at = w.block(b'ADIR')
+        w.u32(0)
+        w.end_block(at)
+    # instruments, wavetables, samples, patterns
+    k = 0
+    for blob in ins + waves + smps:
+        w.put32(ptr_at + 4 * k, w.tell())
+        w.raw(blob)
+        k += 1
+    for si, ch, idx in pats:
+        w.put32(ptr_at + 4 * k, w.tell())
+        w.raw(fur_patn(si, ch, idx, song.patterns.get((si, ch, idx), {}), subs[si].pat_len))
+        k += 1
+    return bytes(w.b)
+
+
+# ---- FamiTracker text -> Furnace song (NES-family chips) ------------------------------
+# Mirrors Furnace 0.6.8.3's own .ftm importer (src/engine/fileOps/ftm.cpp), so the .fur
+# behaves as the same module opened in Furnace would.
+FT_FUR_EFFECTS = {'F': 0x0F, 'B': 0x0B, 'D': 0x0D, 'C': 0xFF, '3': 0x03, 'H': 0x13, 'I': 0x14,
+                  '0': 0x00, '4': 0x04, '7': 0x07, 'P': 0xE5, 'G': 0xED, 'Z': 0x11, '1': 0x01,
+                  '2': 0x02, 'V': 0x12, 'Y': 0x90, 'Q': 0xE1, 'R': 0xE2, 'A': 0x0A, 'S': 0xEC,
+                  'X': 0x0C, 'W': 0x20, 'L': 0xFC, 'O': 0x09, 'T': 0xE6}
+# FamiTracker chip -> (Furnace chip id, Furnace channel count, Furnace instrument type)
+FT_FUR_CHIP = {'2A03': (0x06, 5, 34), 'VRC6': (0x88, 3, 12), 'MMC5': (0x8b, 3, 34),
+               'N163': (0x8c, 8, 17), 'FDS': (0x8a, 1, 15), 'VRC7': (0x9d, 6, 13),
+               'S5B': (0x80, 3, 6)}
+FT_MACRO_PREFIX = {'2A03': 'MACRO', 'VRC6': 'MACROVRC6', 'N163': 'MACRON163', 'S5B': 'MACROS5B'}
+INST_CHIP = {'INST2A03': '2A03', 'INSTVRC6': 'VRC6', 'INSTN163': 'N163', 'INSTS5B': 'S5B',
+             'INSTFDS': 'FDS', 'INSTVRC7': 'VRC7'}
+
+
+def _ft_macros(raw_inst):
+    """{(prefix, type, index): (values, loop, release, setting)}"""
+    out = {}
+    for l in raw_inst:
+        if not l.startswith('MACRO'):
+            continue
+        head, vals = l.split(':', 1)
+        p = head.split()
+        out[(p[0], int(p[1]), int(p[2]))] = ([int(v) for v in vals.split()], int(p[3]), int(p[4]),
+                                              int(p[5]))
+    return out
+
+
+def _fur_macro(code, vals, loop, rel, setting, ftype):
+    """one FamiTracker sequence as a Furnace macro, as Furnace's importer converts it"""
+    vals = list(vals)
+    m = dict(code=code, vals=vals, loop=loop if loop >= 0 else 255, rel=rel if rel >= 0 else 255,
+             mode=0)
+    if code == 1:                                   # arpeggio
+        if setting == 1:                            # fixed: bit 30, and back to the note after
+            vals[:] = [v | (1 << 30) for v in vals]
+            if m['loop'] == 255:
+                vals.append(0)
+    elif code == 4:                                 # pitch: Furnace counts the other way
+        vals[:] = [-v for v in vals]
+        if setting == 0:
+            m['mode'] = 1                           # relative (accumulates), as in FamiTracker
+    return m
+
+
+def ft_text_to_fur(text, log=print):
+    """a FamiTracker text module (every track) -> FurModule ready for write_fur"""
+    first = parse_module(text, 0)
+    exp = first.expansion
+    chips_ft = ['2A03'] + [c for bit, c, _, _ in EXPANSION_LAYOUT if exp & bit]
+    order_fur = [c for c in ('2A03', 'VRC6', 'VRC7', 'FDS', 'MMC5', 'N163', 'S5B') if c in chips_ft]
+    song = FurModule()
+    song.version = FUR_WRITE_VERSION
+    title = next((l.split(None, 1)[1].strip().strip('"') for l in first.info if l.startswith('TITLE')), '')
+    author = next((l.split(None, 1)[1].strip().strip('"') for l in first.info if l.startswith('AUTHOR')), '')
+    song.name, song.author, song.tuning = title, author, 440.0
+    song.compat1 = FUR_COMPAT1_FTM
+    song.chips, fur_first = [], {}
+    pos = 0
+    for c in order_fur:
+        cid, n, _ = FT_FUR_CHIP[c]
+        flags = {}
+        if c == 'S5B':
+            flags = {'chipType': '2'}
+        if c == 'N163':
+            flags = {'channels': str(max(0, (first.n163 or 1) - 1))}
+        song.chips.append(dict(id=cid, name=FUR_CHIPS[cid][0], nch=n, first=pos, flags=flags,
+                               vol=1.0, pan=0.0, panfr=0.0))
+        fur_first[c] = pos
+        pos += n
+    song.chans = pos
+    # FamiTracker channel -> Furnace channel
+    configure(exp, first.nch, first.n163)
+    ft_to_fur = {}
+    for ch in range(first.nch):
+        chip = 'DPCM' if KIND.get(ch) == 'dpcm' else CHIP_OF.get(ch, '2A03')
+        if chip == 'DPCM':
+            ft_to_fur[ch] = 4
+            continue
+        k = sum(1 for c2 in range(ch) if CHIP_OF.get(c2) == chip and KIND.get(c2) != 'dpcm')
+        ft_to_fur[ch] = fur_first[chip] + k
+    # instruments
+    macros = _ft_macros(first.raw_inst)
+    ins_lines = {}
+    for l in first.raw_inst:
+        p = l.split()
+        if p and p[0] in INST_CHIP:
+            ins_lines[int(p[1])] = (INST_CHIP[p[0]], l)
+    n_ins = max(ins_lines) + 1 if ins_lines else 0
+    song.ins_raw, missing = [], collections.Counter()
+    if any(l.startswith('KEYDPCM') for l in first.raw_inst):
+        missing['DPCM samples'] += 1
+    for i in range(n_ins):
+        if i not in ins_lines:
+            song.ins_raw.append(fur_ins2(34, 'unused'))
+            continue
+        chip, l = ins_lines[i]
+        name = l.split('"')[1] if '"' in l else 'instrument %d' % i
+        cid, _, itype = FT_FUR_CHIP[chip]
+        ms = []
+        if chip in FT_MACRO_PREFIX:
+            refs = [int(v) for v in l.split('"')[0].split()[2:7]]
+            # FamiTracker sequence types: volume, arpeggio, pitch, hi-pitch, duty/noise
+            for t, code in ((0, 0), (1, 1), (2, 4), (4, 2)):
+                if t < len(refs) and refs[t] >= 0:
+                    key = (FT_MACRO_PREFIX[chip], t, refs[t])
+                    if key in macros:
+                        vals, loop, rel, setting = macros[key]
+                        ms.append(_fur_macro(code, vals, loop, rel, setting, itype))
+            if len(refs) > 3 and refs[3] >= 0:
+                missing['hi-pitch macros'] += 1
+        else:
+            missing['%s instruments (sound)' % chip] += 1
+        song.ins_raw.append(fur_ins2(itype, name, ms))
+    if missing:
+        log('not carried into the .fur yet: ' + ', '.join('%s (%d)' % kv for kv in missing.items()))
+    # songs and patterns
+    song.subsongs, song.patterns = [], {}
+    for k in range(first.num_subsongs):
+        m = first if k == 0 else parse_module(text, k)
+        s = FurSubsong()
+        s.hz = 60.0
+        s.speeds = [max(1, m.track['speed'])]
+        s.vtempo = (m.track['tempo'] or 150, 150)
+        s.pat_len = m.track['rows']
+        s.ord_len = len(m.orders)
+        s.hilight = (4, 16)
+        s.name = m.track_names[k] if k < len(m.track_names) else ''
+        s.orders = [[0] * s.ord_len for _ in range(song.chans)]
+        s.effect_cols = [1] * song.chans
+        for pos_, od in enumerate(m.orders):
+            for ch, idx in enumerate(od):
+                if ch in ft_to_fur:
+                    s.orders[ft_to_fur[ch]][pos_] = idx
+        saw = next((c for c in range(m.nch) if KIND.get(c) == 'saw'), None)
+        for idx, rows in m.patterns.items():
+            for ch in range(m.nch):
+                if ch not in ft_to_fur:
+                    continue
+                fc = ft_to_fur[ch]
+                out = {}
+                for j, row in enumerate(rows[:s.pat_len]):
+                    cell = row[ch]
+                    nt, it, vt = cell[0], cell[1], cell[2]
+                    note = ins = vol = None
+                    if nt == '---':
+                        note = FUR_NOTE_OFF
+                    elif nt == '===':
+                        note = FUR_NOTE_REL
+                    elif nt != '...':
+                        if nt.endswith('-#'):
+                            note = 60 + int(nt[0], 16)
+                        else:
+                            note = int(nt[2]) * 12 + NOTE_INDEX[nt[:2]] + 60
+                            if CHIP_OF.get(ch) == 'FDS':
+                                note -= 24
+                    if it not in ('..', '.') and nt not in ('---', '==='):
+                        ins = int(it, 16)
+                    if vt not in ('.', '..'):
+                        vol = int(vt, 16)
+                        if ch == saw:
+                            vol = vol * 42 // 15
+                        elif CHIP_OF.get(ch) == 'FDS':
+                            vol = vol * 31 // 15
+                    fx = []
+                    for e in cell[3:]:
+                        if e in ('...', '.') or len(e) != 3:
+                            continue
+                        code = FT_FUR_EFFECTS.get(e[0])
+                        val = int(e[1:], 16)
+                        if code is None:
+                            missing['effect ' + e[0]] += 1
+                            continue
+                        if code == 0x0F and val > 0x1F:
+                            code = 0xFD                 # FamiTracker tempo -> Furnace tempo
+                        if code in (0xE1, 0xE2) and not val & 0xF0:
+                            val |= 0x10                 # as Furnace's importer does
+                        fx.append((code, val))
+                    if note is not None or ins is not None or vol is not None or fx:
+                        out[j] = (note, ins, vol, fx)
+                        s.effect_cols[fc] = max(s.effect_cols[fc], len(fx))
+                if out:
+                    song.patterns[(k, fc, idx)] = out
+        song.subsongs.append(s)
+    for s in song.subsongs:
+        s.effect_cols = [min(8, max(1, v)) for v in s.effect_cols]
+    song.wave_raw, song.sample_raw = [], []
+    return song
+
+
+# ---- quick generic retrace for any Furnace chip -------------------------------------------
+# Not exact: notes go on a row grid (EDxx for in-between ticks), each note's volume envelope
+# (and duty changes) becomes a macro added to a copy of the song's own instrument, other
+# effects land on their row, and pitch wiggles inside a note are dropped.
+FUR_VOL_MAX = {0x06: 15, 0x04: 15, 0x03: 15, 0x80: 15, 0x9a: 31, 0x05: 31, 0x07: 15, 0x47: 15,
+               0x83: 127, 0xa0: 127, 0x82: 127, 0x87: 127, 0x8f: 63, 0x90: 63, 0x91: 63,
+               0x89: 15, 0x9d: 15, 0x8c: 15, 0x8a: 32, 0x88: 15, 0xa1: 15, 0xb4: 15, 0x96: 15,
+               0x9c: 15, 0xa8: 127, 0x84: 15, 0x94: 15, 0x97: 15, 0xac: 63, 0x81: 64, 0xd6: 127}
+FUR_SKIP_FX = {0x0B, 0x0D, 0xFF, 0x0F, 0x09, 0xF0, 0xFD, 0xFE, 0xED, 0xE5, 0x12}
+
+
+def _fur_ticks(f, sub):
+    """per channel {tick: cell}, the number of ticks; rows expanded by speed (raw songs: 1)"""
+    s = f.subsongs[sub]
+    ev = [dict() for _ in range(f.chans)]
+    oi, r, t, row_no, seen, guard = 0, 0, 0, 0, set(), 0
+    speeds = list(s.speeds)
+    while oi < s.ord_len and guard < 400000:
+        guard += 1
+        if r == 0:
+            if oi in seen:
+                break
+            seen.add(oi)
+        jump = skip = None
+        halt = False
+        for ch in range(f.chans):
+            cell = f.patterns.get((sub, ch, s.orders[ch][oi]), {}).get(r)
+            if not cell:
+                continue
+            ev[ch][t] = cell
+            for a, b in cell[3]:
+                if a == 0x0B:
+                    jump = b or 0
+                elif a == 0x0D:
+                    skip = True
+                elif a == 0xFF:
+                    halt = True
+                elif a in (0x0F, 0x09) and b:
+                    speeds = [b]
+        t += speeds[row_no % len(speeds)]
+        row_no += 1
+        if halt:
+            break
+        if jump is not None:
+            if jump in seen:
+                break
+            oi, r = jump, 0
+        elif skip or r + 1 >= s.pat_len:
+            oi, r = oi + 1, 0
+        else:
+            r += 1
+    return ev, t
+
+
+def generic_retrace(f, sub=0, pattern_rows=64, log=print):
+    """FurModule (any chips) -> FurModule retrace (same chips, same instruments + macros)"""
+    s0 = f.subsongs[sub]
+    ev, T = _fur_ticks(f, sub)
+    vmax = []
+    for k, c in enumerate(f.chips):
+        seen = max([cell[2] for ch in range(c['first'], c['first'] + c['nch'])
+                    for cell in ev[ch].values() if cell[2] is not None] or [0])
+        m = FUR_VOL_MAX.get(c['id'])
+        if m is None or seen > m:
+            m = 1
+            while m < seen:
+                m = m * 2 + 1
+        vmax += [m] * c['nch']
+    # row grid: the longest rows that keep (nearly) every note on its own row; a pair of
+    # speeds alternating row by row (a Furnace speed pattern) covers swung timing like 13/14
+    import bisect
+    ons = [(ch, t) for ch in range(f.chans) for t, c in ev[ch].items() if c[0] is not None]
+
+    def starts_for(pat, ph):
+        out, t, k = [], -ph, 0
+        while t <= T:
+            out.append(t)
+            t += pat[k % len(pat)]
+            k += 1
+        return out
+
+    best = ((1,), 0, list(range(T + 1)))
+    best_len = 1.0
+    on_t = np.array([t for _, t in ons], dtype=np.int64)
+    on_c = np.array([c for c, _ in ons], dtype=np.int64)
+    cands = set()
+    for a in range(2, 9):
+        cands.add((a,))
+        for k in (2, 4):
+            for bits in range(1, 2 ** k - 1):
+                cands.add(tuple(a + ((bits >> i) & 1) for i in range(k)))
+    for pat in sorted(cands, key=lambda p: -sum(p) / len(p)):
+        mean = sum(pat) / len(pat)
+        if mean <= best_len or mean > 8.5:
+            continue
+        cyc = sum(pat)
+        for ph in range(cyc):
+            st = np.array(starts_for(pat, ph), dtype=np.int64)
+            r = np.searchsorted(st, on_t, side='right') - 1
+            on = int((st[r] == on_t).sum())
+            key = on_c * (len(st) + 1) + r
+            clash = len(key) - len(np.unique(key))
+            if on >= 0.6 * len(ons) and clash <= 0.03 * len(ons):
+                best, best_len = (pat, ph, list(st)), mean
+                break
+    pat, ph, row_start = best
+    sp = pat[0]
+    log('generic retrace: %d channels on %s; rows of %s ticks (%d notes)'
+        % (f.chans, ', '.join(c['name'] for c in f.chips), '/'.join(map(str, pat)), len(ons)))
+
+    def locate(t):
+        r = bisect.bisect_right(row_start, t) - 1
+        return r, t - row_start[r]
+    nrows = len(row_start)
+    rows = [[None] * nrows for _ in range(f.chans)]
+    new_ins, ins_key = [], {}
+    base_raw = list(f.ins_raw)
+    dropped = collections.Counter()
+
+    c1, c2 = getattr(f, 'compat1', None), getattr(f, 'compat2', None)
+    pitch_ok = bool((c1 and c1[1]) or (c2 and c2[12]))   # pitch macro in E5xx units
+
+    def instrument(ins, vm, dm, pm=None, am=None):
+        if ins is None or ins >= len(base_raw) or base_raw[ins][:4] != b'INS2' or base_raw[ins][-2:] != b'EN':
+            dropped['macros (instrument not INS2)'] += 1
+            return ins
+        key = (ins, vm, dm, pm, am)
+        if key not in ins_key:
+            if len(base_raw) + len(new_ins) >= 256:
+                dropped['macros (256 instruments)'] += 1
+                return ins
+            ms = []
+            if vm:
+                ms.append(dict(code=0, vals=list(vm)))
+            if dm:
+                ms.append(dict(code=2, vals=list(dm)))
+            if pm:
+                ms.append(dict(code=4, vals=list(pm), mode=0))
+            if am:
+                ms.append(dict(code=1, vals=list(am)))
+            extra = fur_ins2(0, '', ms)
+            feat = extra[12:-2]
+            feat = feat[feat.index(b'MA'):] if b'MA' in feat else b''
+            body = base_raw[ins][8:-2] + feat + b'EN'
+            new_ins.append(b'INS2' + struct.pack('<I', len(body)) + body)
+            ins_key[key] = len(base_raw) + len(new_ins) - 1
+        return ins_key[key]
+
+    col_only = set()          # channels whose volume Furnace takes from the column only
+    for c in f.chips:
+        if c['id'] == 0x04:
+            col_only.add(c['first'] + 2)                 # Game Boy wave channel
+    for ch in range(f.chans):
+        e = ev[ch]
+        ticks = sorted(e)
+        vol, duty, ins, e5 = None, None, None, 0x80
+        col_vol = duty_out = None
+        e5_out = 0x80
+        note_ticks = [t for t in ticks if e[t][0] is not None]
+        # a note that starts in the same row as the one before it is an arpeggio step of it
+        absorbed = set()
+        last_row_note = {}
+        for t in note_ticks:
+            r = locate(t)[0]
+            n = e[t][0]
+            if r in last_row_note and isinstance(n, int) and isinstance(e[last_row_note[r]][0], int):
+                absorbed.add(t)
+            else:
+                last_row_note[r] = t
+        note_ticks = [t for t in note_ticks if t not in absorbed]
+        for i, t in enumerate(ticks):
+            note, cins, cvol, fx = e[t]
+            if cins is not None:
+                ins = cins
+            if cvol is not None:
+                vol = cvol
+            for a, b in fx:
+                if a == 0x12:
+                    duty = b
+                elif a == 0xE5 and b is not None:
+                    e5 = b
+            r, d = locate(t)
+            if note is None or t in absorbed:
+                # inside a note: effects other than volume / duty / pitch go on their row
+                keep = [(a, b) for a, b in fx if a is not None and a not in FUR_SKIP_FX]
+                newvol = None
+                if ch in col_only and cvol is not None and cvol != col_vol:
+                    newvol = col_vol = cvol
+                if keep or newvol is not None:
+                    cur = rows[ch][r] or (None, None, None, [])
+                    rows[ch][r] = (cur[0], cur[1], newvol if newvol is not None else cur[2], cur[3] + keep)
+                continue
+            # a note: follow its volume and duty until the next note
+            nxt = next((u for u in note_ticks if u > t), T)
+            vseq, dseq, pseq, aseq, v, du, pv, an = [], [], [], [], vol, duty, e5, note
+            for u in range(t, min(nxt, t + 255)):
+                c = e.get(u)
+                if c:
+                    if u in absorbed:
+                        an = c[0]
+                    if c[2] is not None:
+                        v = c[2]
+                    for a, b in c[3]:
+                        if a == 0x12:
+                            du = b
+                        elif a == 0xE5 and b is not None:
+                            pv = b
+                vseq.append(v)
+                dseq.append(du)
+                pseq.append(pv)
+                aseq.append(an - note if isinstance(an, int) and isinstance(note, int) else 0)
+            am = None
+            if any(aseq):
+                am = tuple(aseq)
+                while len(am) > 1 and am[-1] == am[-2]:
+                    am = am[:-1]
+            pm = None
+            if pitch_ok and len(set(pseq)) > 1:
+                pm = tuple(x - pseq[0] for x in pseq)
+                while len(pm) > 1 and pm[-1] == pm[-2]:
+                    pm = pm[:-1]
+            vm = None
+            if ch not in col_only and any(x is not None for x in vseq) and len(set(vseq)) > 1:
+                first = next(x for x in vseq if x is not None)
+                vm = tuple(x if x is not None else first for x in vseq)
+                while len(vm) > 1 and vm[-1] == vm[-2]:
+                    vm = vm[:-1]
+            dm = None
+            if len(set(dseq)) > 1:
+                first = next((x for x in dseq if x is not None), 0)
+                dm = tuple(x if x is not None else first for x in dseq)
+                while len(dm) > 1 and dm[-1] == dm[-2]:
+                    dm = dm[:-1]
+            out_ins = instrument(ins, vm, dm, pm, am) if (vm or dm or pm or am) else ins
+            if vm:
+                cv = vmax[ch]
+            else:
+                cv = vseq[0] if vseq and vseq[0] is not None else None
+            out_vol = cv if cv != col_vol else None
+            if cv is not None:
+                col_vol = cv
+            fx_out = [(a, b) for a, b in fx if a is not None and a not in FUR_SKIP_FX]
+            if e5 != e5_out:
+                fx_out.append((0xE5, e5))
+                e5_out = e5
+            if d:
+                fx_out.insert(0, (0xED, d))
+            if dm is None and duty is not None and duty != duty_out:
+                fx_out.append((0x12, duty))
+                duty_out = duty
+            if rows[ch][r] is not None and rows[ch][r][0] is not None:
+                dropped['notes sharing a row'] += 1
+                continue
+            rows[ch][r] = (note, out_ins if note not in (FUR_NOTE_OFF, FUR_NOTE_REL, FUR_MACRO_REL) else None,
+                           out_vol, fx_out[:8])
+    if dropped:
+        log('generic retrace dropped: ' + ', '.join('%s (%d)' % kv for kv in dropped.items()))
+    # patterns of pattern_rows rows, identical ones shared per channel
+    out = FurModule()
+    for k in ('version', 'name', 'author', 'tuning', 'chips', 'chans', 'compat1', 'compat2',
+              'compat3', 'meta', 'comment', 'master_vol', 'patchbay', 'patchbay_auto', 'grooves'):
+        setattr(out, k, getattr(f, k, None))
+    out.ins_raw = base_raw + new_ins
+    out.wave_raw, out.sample_raw = list(f.wave_raw), list(f.sample_raw)
+    s = FurSubsong()
+    s.hz, s.vtempo, s.hilight = s0.hz, s0.vtempo, s0.hilight
+    s.speeds, s.time_base, s.raw_speeds = list(pat), 0, list(pat)
+    s.pat_len = pattern_rows
+    nord = (nrows + pattern_rows - 1) // pattern_rows
+    if nord > 256:
+        s.pat_len = min(256, -(-nrows // 256))
+        nord = (nrows + s.pat_len - 1) // s.pat_len
+    s.ord_len = nord
+    s.name = s0.name
+    s.orders = [[0] * nord for _ in range(f.chans)]
+    s.effect_cols = [1] * f.chans
+    s.chan_names = list(getattr(s0, 'chan_names', []) or [])
+    out.patterns = {}
+    for ch in range(f.chans):
+        uniq = {}
+        for o in range(nord):
+            chunk = {j: c for j, c in enumerate(rows[ch][o * s.pat_len:(o + 1) * s.pat_len]) if c}
+            key = repr(sorted(chunk.items()))
+            if key not in uniq:
+                uniq[key] = len(uniq)
+                out.patterns[(0, ch, uniq[key])] = chunk
+            s.orders[ch][o] = uniq[key]
+            for c in chunk.values():
+                s.effect_cols[ch] = max(s.effect_cols[ch], min(8, len(c[3])))
+    out.subsongs = [s]
+    log('generic retrace: %d rows in %d orders of %d rows, %d instruments (%d new with macros)'
+        % (nrows, nord, s.pat_len, len(out.ins_raw), len(new_ins)))
+    return out
+
+
 def load_input(input_source, subsong=0):
     if isinstance(input_source, Module):
         return input_source
     if isinstance(input_source, (bytes, bytearray)):
+        if input_source[:16] == FUR_MAGIC or input_source[:1] == b'x':
+            try:
+                return parse_fur(bytes(input_source), subsong=subsong)
+            except FurError as exc:
+                if input_source[:16] == FUR_MAGIC:
+                    raise SystemExit('Furnace module: %s' % exc)
         if input_source[:18] == b'FamiTracker Module' or input_source[:21] == b'Dn-FamiTracker Module':
             return parse_ftm(input_source, subsong=subsong)
         text = input_source.decode('utf-8', errors='replace')
@@ -780,6 +2488,13 @@ def load_input(input_source, subsong=0):
         return parse_module(text, subsong=subsong)
     if isinstance(input_source, str):
         if '\n' not in input_source and os.path.exists(input_source):
+            if input_source.lower().endswith('.fur'):
+                with open(input_source, 'rb') as fh:
+                    data = fh.read()
+                try:
+                    return parse_fur(data, subsong=subsong)
+                except FurError as exc:
+                    raise SystemExit('%s: %s' % (input_source, exc))
             if input_source.lower().endswith(('.ftm', '.dnm', '.0cc')):
                 with open(input_source, 'rb') as f:
                     data = f.read()
@@ -1059,7 +2774,7 @@ def choose_grid(states, forced=None):
     """Find the row grid.  Songs on a whole speed (tempo 150) use that speed.  Songs whose
     rows are a fractional number of ticks long (e.g. 5.5) get a speed+tempo pair."""
     N = states[SQ1].n
-    ons = np.array([f for c in MUSIC for f in structural_onsets(states[c], 3)])
+    ons = np.array([f for c in MUSIC for f in structural_onsets(states[c], 3)], dtype=int)
     if forced:
         return dict(kind='int', s=forced, phase=int_phase(states, forced), msg='speed %d (forced)' % forced)
     cands = [(S, 150) for S in (3, 4, 5, 6, 7, 8, 9, 10, 12)]
@@ -1216,7 +2931,7 @@ def split_transient(st, a, b, max_pre=9, min_span=6, min_hold=4):
     return None
 
 
-def find_segments(st, ch, merge_gap, aligned):
+def find_segments(st, ch, merge_gap, aligned, row_of=None):
     N = st.n
     ons = np.flatnonzero(st.onset)
     aud = np.concatenate([[0], np.cumsum(st.eff > 0)])
@@ -1286,8 +3001,22 @@ def find_segments(st, ch, merge_gap, aligned):
             duty[last_aud + 1:] = duty[last_aud]
         sg.arp, sg.duty = arp, duty
         sg.fine, sg.detune = simplify_pitch(fine, eff > 0, cents_per_unit(sg.base, ch))
+        sg.vib = None
         if ch == NOI:
             sg.detune = 0
+        elif VIBRATO_EFFECTS and np.any(sg.fine != sg.fine[0]) and not np.any(arp != 0) \
+                and inst_group(ch) in MACRO_CHIPS:
+            # a wobble a 4xy can play: the note keeps a steady detune and gets the vibrato as a
+            # pattern effect, starting on its first tick or on a later row inside it
+            # any tick can start it: a row inside the note can carry Gxx to delay its 4xy
+            # (not inside the note's own first row: that row's effects play on its first tick)
+            vib_starts = [t for t in range(0, min(sg.L - 4, 64))
+                          if t == 0 or row_of is None or row_of(a + t) != row_of(a)]
+            fit = fit_vibrato(np.asarray(sg.fine, int), eff > 0, vib_starts)
+            if fit is not None and fit[5] <= VIB_MAX_MEAN and fit[6] <= VIB_MAX_BAD:
+                _, t0, sp, dp, det, _, _ = fit
+                sg.vib = (t0, sp, dp)
+                sg.fine, sg.detune = np.zeros_like(sg.fine), det
         sg.vol = None if ch == TRI else eff.astype(int).copy()
         sg.cut_at = None
         if ch == TRI:
@@ -1306,6 +3035,101 @@ def cents_per_unit(note, ch):
     if ch == NOI:
         return W_PIT / W_CENT
     return 1731.2 / max(1, period_of(int(note), ch))
+
+
+# ----------------------------------------------------------------------------
+# FamiTracker's vibrato (4xy), exactly as the driver computes it
+# ----------------------------------------------------------------------------
+_NEW_VIB_DEPTH = (1.0, 1.5, 2.5, 4.0, 5.0, 7.0, 10.0, 12.0, 14.0, 17.0, 22.0, 30.0, 44.0, 64.0, 96.0, 128.0)
+_OLD_VIB_DEPTH = (1.0, 1.0, 2.0, 3.0, 4.0, 7.0, 8.0, 15.0, 16.0, 31.0, 32.0, 63.0, 64.0, 127.0, 128.0, 255.0)
+
+
+def _vib_table(new=True):
+    t = np.zeros(256, int)
+    for i in range(16):
+        for j in range(16):
+            if new:
+                t[i * 16 + j] = int(np.sin((j / 16.0) * (3.1415 / 2.0)) * _NEW_VIB_DEPTH[i])
+            else:
+                t[i * 16 + j] = int((j * _OLD_VIB_DEPTH[i]) / 16.0 + 1)
+    return t
+
+
+VIB_TABLE = {True: _vib_table(True), False: _vib_table(False)}
+
+
+def vibrato_offset(phase, depth, new=True):
+    """period offset the driver adds for vibrato phase 0..63 and depth 0..15 (CChannelHandler::
+    GetVibrato).  CalculatePeriod SUBTRACTS it from the period, so a positive value RAISES the
+    pitch (checked against Dn-FamiTracker renders, round 9)."""
+    t, D = VIB_TABLE[new], depth << 4
+    q, r = phase >> 4, phase & 15
+    if q == 0:
+        v = t[D + r]
+    elif q == 1:
+        v = t[D + 15 - r]
+    elif q == 2:
+        v = -t[D + r]
+    else:
+        v = -t[D + 15 - r]
+    if not new:
+        v = (v + t[D + 15] + 1) >> 1
+    return int(v)
+
+
+_VIB_CURVES = {}
+
+
+def vibrato_curves(L, new=True):
+    """[speed, depth, n] -> period offset on the n-th tick after a 4xy with the phase at 0
+    (the driver advances the phase before it plays each tick, the first one included)"""
+    key = (L, new)
+    if key not in _VIB_CURVES:
+        out = np.zeros((16, 16, L), int)
+        for sp in range(1, 16):
+            phases = (sp * (np.arange(L) + 1)) & 63
+            for d in range(16):
+                lut = np.array([vibrato_offset(ph, d, new) for ph in range(64)])
+                out[sp, d] = lut[phases]
+        _VIB_CURVES[key] = out
+    return _VIB_CURVES[key]
+
+
+MUSICAL_BORDERS = True     # pattern length from the music's repetition, patterns start on the first note
+VIBRATO_EFFECTS = True     # wobbling notes that a 4xy reproduces get 4xy instead of a pitch macro
+VIB_MAX_MEAN = 0.35        # ... when the fit is off by at most this many period units per tick on average
+VIB_MAX_BAD = 0.05         # ... and more than one unit off on at most this share of ticks
+
+
+def fit_vibrato(fine, audible, starts, new=True):
+    """best (start tick, speed, depth, detune, error) for a note's fine-pitch curve played as
+    a steady detune plus a 4xy that begins at one of `starts` (ticks from the note start where
+    a row begins, phase 0).  fine follows NSFImport's sign: fine = -(period offset)."""
+    L = len(fine)
+    aud = audible if audible.any() else np.ones(L, bool)
+    if L < 6 or aud.sum() < 6:
+        return None
+    curves = vibrato_curves(max(L, 8), new)
+    best = None
+    for t0 in starts:
+        if t0 >= L - 4:
+            continue
+        n = L - t0
+        pred = np.zeros((16, 16, L), int)
+        pred[:, :, t0:] = curves[:, :, :n]                    # fine = -(period offset) and the driver subtracts the vibrato
+        res = fine[None, None, :] - pred                      # what is left: should be a constant
+        c = np.round(np.median(res[:, :, aud], axis=2)).astype(int)
+        err = np.abs(res - c[:, :, None])[:, :, aud]
+        bad = (err > 1).mean(axis=2)
+        mean = err.mean(axis=2)
+        score = mean + 4 * bad
+        score[0, :] = np.inf                                  # speed 0 is no vibrato
+        score[:, 0] = np.inf
+        i = np.unravel_index(np.argmin(score), score.shape)
+        cand = (float(score[i]), t0, int(i[0]), int(i[1]), int(c[i]), float(mean[i]), float(bad[i]))
+        if best is None or cand[0] < best[0]:
+            best = cand
+    return best
 
 
 def simplify_pitch(fine, audible, cpu=4.0):
@@ -1973,11 +3797,40 @@ def build_rows(segs, grid, nframes, states, duty_insts=frozenset(), env_of=None)
                 length = sg.cut_at - (grid.row_start(sg.row) + sg.delay)
                 if 1 <= length <= 0x7F and not any(e[0] == 'S' for e in own.eff):
                     own.eff.append('S%02X' % length)
+        if ch != NOI and any(getattr(sg, 'vib', None) for sg in segs[ch]):
+            place_vibrato(rows, segs[ch], grid, ch)
         if inst_group(ch) is None:
             passthrough_envelopes(rows, segs[ch], grid, ch)
         elif env_of is not None and KIND.get(ch) in ('pulse', 'noise'):
             STATS['volume column follows'] += column_follow(rows, segs[ch], grid, ch, states[ch], env_of)
     return rows
+
+
+def place_vibrato(rows, segs, grid, ch):
+    """4xy where a note's vibrato starts (its own row, or a later row inside it) and 400 on the
+    channel's next note: 400 stops the vibrato and resets its phase, so every vibrato starts
+    from phase 0 as fitted"""
+    order = [sg for sg in segs if hasattr(sg, 'row') and sg.row < len(rows) and rows[sg.row][ch].seg is sg]
+    for i, sg in enumerate(order):
+        if not getattr(sg, 'vib', None):
+            continue
+        t0, sp, dp = sg.vib
+        k, dd = (sg.row, 0) if t0 == 0 else grid.locate(sg.start + t0)
+        cell = rows[k][ch] if k < len(rows) else None
+        need = 2 if dd else 1
+        if cell is None or len(cell.eff) + need > 4 or (k != sg.row and cell.note is not None) or \
+                (dd and any(e[0] == 'G' for e in cell.eff)) or (k == sg.row and dd != 0):
+            STATS['vibrato not placed'] += 1
+            continue
+        if dd:
+            cell.eff.append('G%02X' % dd)          # an empty row's effects wait for the delay too
+        cell.eff.append('4%X%X' % (sp, dp))
+        STATS['vibrato'] += 1
+        stop = order[i + 1].row if i + 1 < len(order) else grid.locate(sg.start + sg.L)[0]
+        if stop < len(rows) and len(rows[stop][ch].eff) < 4:
+            rows[stop][ch].eff.insert(0, '400')
+        else:
+            STATS['vibrato left running'] += 1
 
 
 def column_follow(rows, segs, grid, ch, st, env_of, min_gain=3):
@@ -2105,28 +3958,134 @@ def pattern_chunks(rows, pr):
     return out
 
 
-def layout_chunks(rows, pr, preroll, loop_row):
-    """Cut rows into patterns.  The intro (rows before loop_row) and the loop each start on
-    a fresh pattern, so the song can jump back to the first loop pattern.
-    Returns (chunks, order index where the loop starts)."""
+def border_starts(n, pr, preroll, loop_row, phase=None):
+    """first row of every pattern: the preroll row (if any), the intro and the loop each start
+    a pattern, and inside them a new pattern starts every pr rows counted from `phase` (the
+    row of the song's first note).  Patterns cut short by this end with D00."""
+    pos = 1 if preroll else 0
+    phase = pos if phase is None else phase
+    starts = [0] if preroll else []
+    secs = [(pos, loop_row), (loop_row, n)] if loop_row > pos else [(pos, n)]
+    for a, b in secs:
+        if a >= b:
+            continue
+        starts.append(a)
+        r = a + ((phase - a) % pr or pr)
+        while r < b:
+            starts.append(r)
+            r += pr
+    return starts
+
+
+def layout_chunks(rows, pr, preroll, loop_row, phase=None):
+    """Cut rows into patterns (see border_starts).  Returns (chunks, order index where the
+    loop starts)."""
+    global _LAST_CHUNK_STARTS
     blank = lambda: [Cell() for _ in range(NCH)]
-    chunks, pos = [], 0
-    if preroll:
-        chunks.append([rows[0]] + [blank() for _ in range(pr - 1)])
-        pos = 1
-    sections = [(pos, len(rows))]
-    if loop_row > pos:
-        sections = [(pos, loop_row), (loop_row, len(rows))]
-    loop_order = 0
-    for a, b in sections:
-        if a == loop_row and loop_row > pos:
-            loop_order = len(chunks)
-        for i in range(a, b, pr):
-            ch = rows[i:min(i + pr, b)]
-            while len(ch) < pr:
-                ch.append(blank())
-            chunks.append(ch)
+    starts = border_starts(len(rows), pr, preroll, loop_row, phase)
+    _LAST_CHUNK_STARTS = starts
+    ends = starts[1:] + [len(rows)]
+    chunks, loop_order = [], 0
+    for i, (a, b) in enumerate(zip(starts, ends)):
+        if a == loop_row and (loop_row > (1 if preroll else 0) or (preroll and loop_row == 1)):
+            loop_order = i                  # (a loop at row 1 skips the preroll row's tempo trick)
+        ch = rows[a:b] if not (preroll and a == 0) else rows[:1]
+        ch = list(ch)
+        while len(ch) < pr:
+            ch.append(blank())
+        chunks.append(ch)
     return chunks, loop_order
+
+
+def first_note_row(rows):
+    for i, r in enumerate(rows):
+        if any(c.note is not None and c.note not in ('---', '===') for c in r):
+            return i
+    return 0
+
+
+def repetition(rows, chans, max_lag=200):
+    """{lag: share of rows whose new notes on `chans` are repeated exactly `lag` rows later}"""
+    n = len(rows)
+    key = [tuple(r[c].note if r[c].note not in (None, '---', '===') else None for c in chans) for r in rows]
+    act = np.array([any(k) for k in key])
+    out = {}
+    for L in range(4, min(max_lag, n // 2) + 1):
+        a = act[:n - L] | act[L:]
+        same = np.fromiter((key[i] == key[i + L] for i in range(n - L)), bool, n - L)
+        out[L] = float((same & a).sum()) / max(1, int(a.sum()))
+    return out
+
+
+def musical_pattern_rows(rows):
+    """pattern length from how the music repeats: the strongest repetition period of the bass
+    and drums (all channels if those barely repeat), doubled or halved into 32..128 rows.
+    Checked against hand-made Mega Man 2 and Silver Surfer retraces: their pattern length is
+    this period or twice / half of it.  None when nothing repeats clearly."""
+    rhythm = [c for c in (TRI, NOI, DPCM) if c < NCH]
+    rep = repetition(rows, rhythm)
+    if not rep or max(rep.values()) < 0.15:
+        rep = repetition(rows, list(MUSIC))
+    if not rep or max(rep.values()) < 0.15:
+        return None
+    L = max(rep, key=lambda k: rep[k] * (1.0 if 8 <= k <= 128 else 0.5))
+    while L < 32 and L * 2 <= 256:
+        L *= 2
+    while L > 128 and L % 2 == 0:
+        L //= 2
+    return L if L <= 256 else None
+
+
+def align_loop(rows, loop_row, pr, phase, preroll):
+    """put the loop start on a pattern border.  Returns (rows, loop_row, phase).
+    1. Earlier, when the rows just before the loop point play the same notes as the last rows
+       of the loop: the game's loop point usually sits just after the phrase's first chord,
+       because the intro plays that chord with another instrument or one more drum hit.  The
+       song then ends that many rows sooner and each loop pass replays the intro's version.
+    2. A short intro (less than a pattern) that would need most of a pattern copied: it becomes
+       its own short pattern (a pickup) and the patterns start at the loop.
+    3. Otherwise later: the rows after the loop point are copied to the end, which plays
+       exactly what the jump back would have played."""
+    n = len(rows)
+    pos = 1 if preroll else 0
+    if loop_row <= pos or loop_row >= n:
+        return rows, loop_row, phase
+    rel = (loop_row - phase) % pr
+    if rel == 0:
+        return rows, loop_row, phase
+
+    def notes(r):
+        return [c.note if c.note not in ('---', '===') else None for c in r]
+
+    def alike(r1, r2):
+        a, b = notes(r1), notes(r2)
+        used = [k for k in range(len(a)) if a[k] or b[k]]
+        return not used or sum(a[k] == b[k] for k in used) / len(used) >= 0.6
+
+    back = rel
+    if preroll and loop_row - back == 0:
+        back -= 1                         # the preroll row (tempo trick) can't be looped: row 1
+    if 0 < back <= max(2, pr // 8) and loop_row - back >= pos and n - back > loop_row:
+        same = [alike(rows[loop_row - back + i], rows[n - back + i]) for i in range(back)]
+        if same[0] and sum(same) >= 0.75 * back:
+            STATS['loop moved back'] = back
+            return rows[:n - back], loop_row - back, phase
+    fwd = pr - rel
+    if fwd > pr // 2 and loop_row - phase < pr and loop_row > phase:
+        STATS['intro pickup'] = 1
+        return rows, loop_row, loop_row
+    L = n - loop_row
+
+    def copy(r):
+        out = []
+        for c in r:
+            d = Cell()
+            d.note, d.inst, d.vol, d.seg, d.eff = c.note, c.inst, c.vol, c.seg, list(c.eff)
+            out.append(d)
+        return out
+    rows = rows + [copy(rows[loop_row + i % L]) for i in range(fwd)]
+    STATS['loop moved forward'] = fwd
+    return rows, loop_row + fwd, phase
 
 
 def pick_pattern_rows(rows, columns, preroll, loop_row, candidates=(16, 24, 32, 48, 64)):
@@ -2292,6 +4251,11 @@ def _apply_cell(o, ev, f, c):
             o.duty = o.cur_duty = int(e[1:], 16)     # Vxx sets the default and the current duty
         elif e[0] == '0':
             o.xy = (int(e[1], 16), int(e[2], 16))
+        elif e[0] == '4' and c != NOI:
+            v = int(e[1:], 16)
+            o.vib_depth, o.vib_speed = v & 15, v >> 4
+            if v == 0:
+                o.vib_phase = 0                   # 400 stops it and resets the phase
         elif e[0] == 'S':
             o.cut_at = f + int(e[1:], 16)
             cut_now = True
@@ -2336,7 +4300,9 @@ def simulate(text, nframes):
         o.duty, o.xy, o.cut_at, o.vol, o.finep = 0, (0, 0), None, 15, 0
         o.cur_duty = 0
         o.slide, o.soff = None, 0
+        o.vib_speed, o.vib_depth, o.vib_phase = 0, 0, 0
         chs[c] = o
+    vib_new = not any(l.split()[:2] == ['VIBRATO', '0'] for l in m.params)
 
     def macro_of(inst, t):
         if inst is None:
@@ -2345,10 +4311,13 @@ def simulate(text, nframes):
         return macros.get((chip, t, refs[t])) if refs[t] >= 0 else None
 
     f, oi, r, accum, row_f, events = 0, 0, 0, 0, 0, {}
+    halted = False
     while f < nframes:
         if accum <= 0:
+            if halted:
+                break                       # C00: the song stops after that row
             if oi >= len(m.orders):
-                break
+                oi = 0                      # FamiTracker wraps from the last frame to the first
             order = m.orders[oi]
             skip, jump = False, None
             for c in range(NCH):
@@ -2364,6 +4333,8 @@ def simulate(text, nframes):
                         skip = True
                     elif e[0] == 'B':
                         jump = int(e[1:], 16)
+                    elif e[0] == 'C':
+                        halted = True
             row_f = f
             # a delayed note from the previous row that never got its turn plays now
             # (FamiTracker's driver reads it at the start of the next row)
@@ -2395,6 +4366,9 @@ def simulate(text, nframes):
             o, ev, d = chs[c], events.get(c), out[c]
             if ev is not None and not ev['done'] and k == ev['delay']:
                 _apply_cell(o, ev, f, c)
+            # the driver advances the vibrato phase every tick, playing or not, before it plays
+            o.vib_phase = (o.vib_phase + o.vib_speed) & 63
+            o.vib_now = vibrato_offset(o.vib_phase, o.vib_depth, vib_new) if o.vib_speed or o.vib_depth else 0
             if o.cut_at is not None and f >= o.cut_at:
                 o.playing, o.cut_at = False, None
             if o.playing:
@@ -2425,7 +4399,7 @@ def simulate(text, nframes):
                 if o.slide is not None and (f > o.t0 or SLIDE_FIRST_TICK):
                     goal, sp = o.slide
                     o.soff = min(goal, o.soff + sp) if goal > o.soff else max(goal, o.soff - sp)
-                d['fine'][f] = -o.cum + o.finep - o.soff  # positive macro value = lower pitch
+                d['fine'][f] = -o.cum + o.finep - o.soff + o.vib_now  # positive = lower pitch
                 md = macro_of(o.inst, M_DUTY)
                 if md and o.pos[M_DUTY] < len(md[0]):
                     o.cur_duty = md[0][o.pos[M_DUTY]]   # a running duty macro sets it every tick;
@@ -2535,7 +4509,7 @@ def prepare(text_or_mod, speed=None, tolerance=0.1, keep_all=False, verbose=True
         grid = GridF(info['S'], info['T'], info['shift'], T)
         merge_gap = max(3, int(grid.r))
     aligned = np.array([grid.locate(f)[1] == 0 for f in range(T)])
-    segs = {c: find_segments(states[c], c, merge_gap, aligned) for c in MUSIC}
+    segs = {c: find_segments(states[c], c, merge_gap, aligned, lambda f: grid.locate(f)[0]) for c in MUSIC}
     quantize_segments(segs, tolerance)
 
     if info['kind'] == 'int':
@@ -2779,6 +4753,10 @@ def finish(ctx, instruments, macros, pattern_rows=None):
         vals, loop, _setting = macros[(e[0], M_VOL, e[1])]
         return (vals, loop)
     rows = build_rows(segs, grid, T, states, duty_insts, env_of if VOLUME_FOLLOW else None)
+    if STATS['vibrato']:
+        log('%d note(s) play their vibrato with a 4xy effect%s' % (
+            STATS['vibrato'], '' if not STATS['vibrato not placed'] else
+            ' (%d more had no free effect column)' % STATS['vibrato not placed']))
     if STATS['volume column follows']:
         log('%d note(s) follow the game\'s volume with the volume column, row by row'
             % STATS['volume column follows'])
@@ -2801,20 +4779,40 @@ def finish(ctx, instruments, macros, pattern_rows=None):
         if loop_row >= len(rows) - 1:
             loop_row = 0
     columns = [max(1, min(4, max(len(r[c].eff) for r in rows))) for c in range(NCH)]
-    pr = pattern_rows or pick_pattern_rows(rows, columns, preroll, loop_row)
+    phase = first_note_row(rows) if MUSICAL_BORDERS else None
+    pr = pattern_rows or (musical_pattern_rows(rows) if MUSICAL_BORDERS else None)
+    if pr:
+        log('patterns: %d rows, the first one starting on the song\'s first note (row %d)'
+            % (pr, phase or 0))
+    else:
+        pr = pick_pattern_rows(rows, columns, preroll, loop_row)
+    if phase is not None and loop_row:
+        rows, loop_row, phase = align_loop(rows, loop_row, pr, phase, preroll)
+        if STATS['loop moved back'] or STATS['loop moved forward']:
+            log('loop start moved %s by %d row(s) to begin on a pattern border%s' % (
+                'back' if STATS['loop moved back'] else 'forward',
+                STATS['loop moved back'] or STATS['loop moved forward'],
+                ' (those rows play the same notes in the intro and at the end of the loop)'
+                if STATS['loop moved back'] else ''))
+        elif STATS['intro pickup']:
+            log('the intro is shorter than a pattern: it gets its own short pattern and the '
+                'patterns start at the loop (row %d)' % loop_row)
     if preroll:
         add_global_effect(rows, 0, 'F%02X' % grid.first)
         add_global_effect(rows, 0, 'D00')
         add_global_effect(rows, 1, 'F%02X' % s)
+    starts = border_starts(len(rows), pr, preroll, loop_row, phase)
+    for a_, b_ in zip(starts, starts[1:]):
+        if b_ - a_ < pr and not (preroll and a_ == 0):
+            add_global_effect(rows, b_ - 1, 'D00')            # a pattern cut short
     if loop_row:
-        add_global_effect(rows, loop_row - 1, 'D00')          # intro ends early
-        _, loop_order = layout_chunks(rows, pr, preroll, loop_row)
+        _, loop_order = layout_chunks(rows, pr, preroll, loop_row, phase)
         add_global_effect(rows, len(rows) - 1, 'B%02X' % loop_order)   # jump back to the loop
         log('loop starts at row %d (order %02X); the last row jumps back to it' % (loop_row, loop_order))
     if halts:
         add_global_effect(rows, len(rows) - 1, 'C00')          # the song ends here, as in the game
     columns = [max(1, min(4, max(len(r[c].eff) for r in rows))) for c in range(NCH)]
-    chunks, _ = layout_chunks(rows, pr, preroll, loop_row)
+    chunks, _ = layout_chunks(rows, pr, preroll, loop_row, phase)
     out_text, orders, npat = write_module(m, macros, instruments, chunks, columns, s, grid.tempo,
                                           pr, 'auto retrace')
     log('%d raw rows -> %d rows in %d orders of %d rows; %d patterns, %d instruments, %d macros'
@@ -3546,8 +5544,9 @@ def main(argv=None):
     ap.add_argument('input')
     ap.add_argument('-o', '--output', default=None,
                     help='output path (default: retrace.ftm, or retrace.txt with --format txt)')
-    ap.add_argument('--format', choices=('ftm', 'txt'), default=None,
-                    help='output format: native binary FTM by default, or FamiTracker text with --format txt')
+    ap.add_argument('--format', choices=('ftm', 'txt', 'fur'), default=None,
+                    help='output format: native binary FTM by default, FamiTracker text with --format txt, '
+                         'or a Furnace module with --format fur (NES-family chips; experimental)')
     ap.add_argument('--txt', action='store_true',
                     help='shortcut for --format txt')
     ap.add_argument('--famitracker-exe', default=None, metavar='PATH',
@@ -3568,6 +5567,11 @@ def main(argv=None):
                     help='how reluctant to create a new instrument (default %g). Higher = fewer, '
                          'more general instruments and less exact notes; 0 = as many as needed' % FACILITY_COST)
     ap.add_argument('--keep-all', action='store_true', help='do not trim to one loop')
+    ap.add_argument('--generic', action='store_true',
+                    help='quick retrace of a .fur for any chip, written as .fur (automatic for '
+                         'chips FamiTracker does not have)')
+    ap.add_argument('--info', action='store_true',
+                    help='describe a Furnace .fur (chips, channels, songs) and stop')
     ap.add_argument('--search', action='store_true',
                     help='try other settings (row grid, instrument tolerance, pitch tolerance), play '
                          'each version back, and keep whichever is closest to the game (slower)')
@@ -3577,10 +5581,45 @@ def main(argv=None):
     selection.add_argument('--subsong-range', type=int, nargs=2, metavar=('START', 'END'),
                            help='convert an inclusive range of zero-based subsong indices, e.g. --subsong-range 2 5')
     args = ap.parse_args(argv)
+    if args.info:
+        with open(args.input, 'rb') as fh:
+            data = fh.read()
+        try:
+            print(describe_fur(read_fur(data)))
+        except FurError as exc:
+            raise SystemExit('%s: %s' % (args.input, exc))
+        return 0
+    if args.input.lower().endswith('.fur'):
+        with open(args.input, 'rb') as fh:
+            data = fh.read()
+        try:
+            f = read_fur(data)
+            nes = True
+            try:
+                fur_ft_layout(f)
+            except FurError:
+                nes = False
+            if args.generic or not nes:
+                sub = args.subsong or 0
+                if not nes:
+                    print('this song uses chips FamiTracker does not have: making a quick generic '
+                          'retrace as a Furnace module')
+                out_song = generic_retrace(f, sub, args.pattern_rows or 64)
+                binary = write_fur(out_song)
+                read_fur(binary)
+        except FurError as exc:
+            raise SystemExit('%s: %s' % (args.input, exc))
+        if args.generic or not nes:
+            path = args.output or 'retrace.fur'
+            with open(path, 'wb') as fh:
+                fh.write(binary)
+            print('wrote %s (%d bytes, Furnace module version %d)' % (path, len(binary),
+                  out_song.version if 157 <= (out_song.version or 0) <= FUR_WRITE_VERSION else FUR_WRITE_VERSION))
+            return 0
     if args.txt and args.format == 'ftm':
         ap.error('--txt cannot be combined with --format ftm')
     output_format = args.format or ('txt' if args.txt else 'ftm')
-    output_path = args.output or ('retrace.txt' if output_format == 'txt' else 'retrace.ftm')
+    output_path = args.output or ('retrace.' + output_format)
     PITCH_TOL = args.pitch_tol
     FACILITY_COST = args.instrument_cost
 
@@ -3640,6 +5679,29 @@ def main(argv=None):
             out = combine_retraces(outputs, output_names)
     except ValueError as exc:
         raise SystemExit(str(exc))
+    if output_format == 'fur':
+        problems = validate_text(out)
+        if problems:
+            print('\nFORMAT CHECK: %d problem(s) in the module:' % len(problems))
+            for p in problems[:20]:
+                print('  ', p)
+            return 1
+        try:
+            song = ft_text_to_fur(out)
+            binary = write_fur(song)
+            check = read_fur(binary)
+            if len(check.subsongs) != len(outputs):
+                raise FurError('song count check failed')
+        except FurError as exc:
+            print('\n.fur export failed: %s' % exc, file=sys.stderr)
+            return 1
+        with open(output_path, 'wb') as f:
+            f.write(binary)
+        print('\nwrote %s (%d subsong%s, %d bytes, Furnace module version %d)' %
+              (output_path, len(outputs), '' if len(outputs) == 1 else 's', len(binary), FUR_WRITE_VERSION))
+        print('note: Furnace plays FamiTracker instruments and effects slightly differently, so this is '
+              'close but not yet exact (Furnace-exact retraces are the next step)')
+        return 0
     if exotic and output_format == 'ftm':
         # the binary .ftm writer only knows the 2A03 and VRC6; text works for every chip
         output_format = 'txt'
